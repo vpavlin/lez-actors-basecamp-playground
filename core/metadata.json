@@ -1,0 +1,32 @@
+{
+ "name": "lez_actors_module",
+ "display_name": "LEZ Actors Core (playground)",
+ "version": "0.1.0",
+ "type": "core",
+ "interface": "universal",
+ "category": "developer",
+ "description": "Playground (experimental, may change or go away): LEZ v0.4 actor-program explorer and caller: reads actor state over the sequencer's JSON-RPC, calls programs and sends native transfers with a fee and a payer through LEZ's v0.4 wallet library (core_ffi). Built on the Logos tech stack; not affiliated with Logos.",
+ "main": "lez_actors_module_plugin",
+ "dependencies": [],
+ "nix": {
+  "packages": {
+   "build": [
+    "openssl"
+   ],
+   "runtime": [
+    "openssl"
+   ]
+  },
+  "external_libraries": [
+   {
+    "name": "core_ffi"
+   }
+  ],
+  "cmake": {
+   "find_packages": [],
+   "extra_sources": [],
+   "extra_include_dirs": [],
+   "extra_link_libraries": []
+  }
+ }
+}
