@@ -23,6 +23,11 @@ links LEZ's own C library, `lez/core_ffi`, built from the pinned LEZ commit (ADR
 - **Fees.** Every user public tx needs a `FeeDeclaration`, and the **payer signs**. LEZ refuses a
   payer that is a *non-signing* mention: "Fee payer is a non-signing account of this transaction".
   So a mention of the payer must always authorize *(verified)*.
+- **A revert costs the whole declared gas limit** *(verified, local dev chain, base fees 8/8)*. The
+  same hello_world_with_authorization call cost 62,800 raw units signed (applied) and 16,003,576
+  unsigned (reverted). That's about the wallet's gas_limit 2,000,000 × base_fee_exec 8 plus
+  storage. A failing call is ~250× dearer than a working one, so declare a tighter gas limit when
+  a revert is likely.
 - **Reverts are included and charged.** A guest panic (e.g. `assert!(input.is_authorized)`) still
   puts the tx in a block and still takes the fee; only the state is unchanged. The RPC gives no
   revert flag. We tell a revert by comparing the actor state before and after *(verified)*.
@@ -129,6 +134,22 @@ RISC0_DEV_MODE=1 sequencer_service start <home>                        # RPC on 
   real ones.
 - Guest stdout/stderr, including panic messages such as `Missing required authorization`, goes to
   the sequencer's stderr. That's the only place a revert reason appears.
+
+## 6b. A local chain embedded in an app (what this playground does)
+
+- core_ffi already contains the sequencer (`sequencer_ffi_start_sequencer`), but it builds
+  sequencer_service without `rpc` and binds port 0. Our patch (`patches/0001`) adds a `local-chain`
+  feature (`rpc` + `standalone` + `prove`) and two functions: `sequencer_ffi_local_setup` (=
+  `setup --create-channel`) and `sequencer_ffi_start_local(home, port)`. With `prove`, guests run
+  in-process, so **no r0vm**. *(verified: Basecamp 0.3.1 and logosctl)*
+- With `gossip` left out of the config, gossip is off. `metrics_address: null` disables the
+  metrics exporter (`start` only installs it in the binary anyway).
+- `block_create_timeout` must be under `posting_timeout` (25 s in the dev params): 3 s works.
+- The wallet config's **`seq_poll_timeout` is the delay between inclusion polls**, not a timeout.
+  The window is `seq_tx_poll_max_blocks` polls. At 30 s, each of a deploy's 4 transactions waited
+  half a minute. 1 s × 120 polls returns about a second after inclusion.
+- Guest panics print to the host process's stderr. Teeing stdout/stderr through a pipe (the
+  module's `LogTap`) gives both the chain log and the revert reasons.
 
 ## 7. Example programs (`examples/program_deployment`)
 

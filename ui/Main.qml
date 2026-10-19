@@ -149,7 +149,11 @@ Item {
         return root.shortId(id)
     }
     function stateColor(state) { return state === "applied" ? root.cOk : (["reverted", "failed", "unknown"].indexOf(state) >= 0 ? root.cErr : root.cWarn) }
-    function bytesText(hex, text) { return text !== undefined ? "“" + text + "”" : (hex ? "0x" + hex : "(empty)") }
+    function bytesText(hex, text) { return !hex ? "(empty)" : text !== undefined ? "“" + text + "”" : "0x" + hex }
+    function payerFunded() {
+        for (var i = 0; i < root.accounts.length; i++) if (root.accounts[i].accountId === root.st.payer) return root.accounts[i].onChain && root.accounts[i].balance !== "0"
+        return false
+    }
     Timer { id: busyGuard; interval: 30000; onTriggered: root.busy = false }
     Timer { interval: 3000; running: true; repeat: true; onTriggered: root.refresh() }
     Timer { id: toastTimer; interval: 6000; onTriggered: root.toastMsg = "" }
@@ -369,13 +373,13 @@ Item {
                             visible: !exCard.modelData.deployed
                             LogosButton {
                                 text: exCard.deploying ? "Deploying..." : "Deploy"
-                                enabled: !exCard.deploying && root.walletOpen && !!root.st.payer && root.hl.reachable
+                                enabled: !exCard.deploying && root.walletOpen && root.payerFunded() && root.hl.reachable
                                 onClicked: root.act("deployExample", [exCard.modelData.name], "Deploying " + exCard.modelData.name + " (a few blocks)")
                             }
                             T3 {
                                 Layout.fillWidth: true
                                 color: exCard.deployJob && exCard.deployJob.state === "failed" ? root.cErr : root.cText3
-                                text: exCard.deployJob ? (exCard.deployJob.state === "failed" ? exCard.deployJob.error : exCard.deployJob.state) : (root.st.payer ? "fee paid by " + root.shortId(root.st.payer) : "needs a payer (step 3)")
+                                text: exCard.deployJob ? (exCard.deployJob.state === "failed" ? exCard.deployJob.error : exCard.deployJob.state) : (root.payerFunded() ? "fee paid by " + root.shortId(root.st.payer) : "needs a funded payer (step 3)")
                             }
                         }
                         Repeater {

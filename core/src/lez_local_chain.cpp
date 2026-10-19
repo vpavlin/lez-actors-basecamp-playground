@@ -52,7 +52,9 @@ constexpr int kMaxSegments = 8;
 
 bool noise(const std::string& line) {
     return line.find("jsonrpsee_server::server] connection") != std::string::npos ||
-           line.find("risc0_zkvm::host::server::exec::executor") != std::string::npos;
+           line.find("risc0_zkvm::host::server::exec::executor") != std::string::npos ||
+           line.find("ModuleProxy:") != std::string::npos ||          // the host's own call tracing
+           line.find("LogosAPIConsumer") != std::string::npos;
 }
 
 }  // namespace

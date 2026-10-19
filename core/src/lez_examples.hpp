@@ -41,8 +41,9 @@ inline const std::vector<Example>& examples() {
          {},
          {{"unsigned", "Call without the account's signature", "reverted",
            "The account doesn't sign, so the guest panics with \"Missing required authorization\". "
-           "In v0.4 a reverted call is still included in a block and the fee is still charged; only "
-           "the state stays unchanged.",
+           "In v0.4 a reverted call is still included in a block and the fee is still charged, and it "
+           "costs the whole gas limit the transaction declared (here ~16 M raw units against ~60 k for "
+           "the signed call below); only the state stays unchanged.",
            true, "no signature"},
           {"signed", "Call with the account's signature", "applied",
            "Now the account authorizes its mention, the guest sees is_authorized = true, and the "
