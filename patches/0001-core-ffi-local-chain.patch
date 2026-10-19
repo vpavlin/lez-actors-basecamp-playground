@@ -1,0 +1,203 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 2e5782d0..0b8a2ec6 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1999,6 +1999,7 @@ dependencies = [
+ name = "core_ffi"
+ version = "0.1.0"
+ dependencies = [
++ "anyhow",
+  "bip39",
+  "cbindgen",
+  "common",
+@@ -2009,6 +2010,7 @@ dependencies = [
+  "lee_core",
+  "log",
+  "programs",
++ "sequencer_core",
+  "sequencer_executor_actor",
+  "sequencer_service",
+  "sequencer_service_rpc",
+diff --git a/lez/core_ffi/Cargo.toml b/lez/core_ffi/Cargo.toml
+index 5d5d6ede..7bd5d53f 100644
+--- a/lez/core_ffi/Cargo.toml
++++ b/lez/core_ffi/Cargo.toml
+@@ -8,6 +8,8 @@ edition = "2024"
+ lee.workspace = true
+ lee_core.workspace = true
+ sequencer_service.workspace = true
++sequencer_core.workspace = true
++anyhow.workspace = true
+ sequencer_executor_actor = { workspace = true, features = ["actor"] }
+ sequencer_storage_actor.workspace = true
+ sequencer_service_rpc.workspace = true
+@@ -42,3 +44,5 @@ ignored = [
+ [features]
+ default = ["prove"]
+ prove = ["lee/prove"]
++# An in-process local dev chain with its JSON-RPC (src/sequencer/api/local.rs): no Bedrock, no r0vm.
++local-chain = ["sequencer_service/rpc", "sequencer_service/standalone", "sequencer_service/prove"]
+diff --git a/lez/core_ffi/core_ffi.h b/lez/core_ffi/core_ffi.h
+index f9fdd70b..1f830ffa 100644
+--- a/lez/core_ffi/core_ffi.h
++++ b/lez/core_ffi/core_ffi.h
+@@ -1255,6 +1255,26 @@ InitializedSequencerServiceFFIResult sequencer_ffi_start_sequencer(const struct
+  */
+ enum FfiOperationError sequencer_ffi_stop_sequencer(struct SequencerServiceFFI *sequencer);
+ 
++/**
++ * Sets up a local chain's home from a config template (a genesis config, as in
++ * `configs/debug/sequencer_config.json`). A home that is already set up is left as it is.
++ *
++ * # Safety
++ * All pointers must be valid null-terminated C strings.
++ */
++enum FfiOperationError sequencer_ffi_local_setup(const char *home,
++                                                 const char *template_path,
++                                                 const char *funding_public_key);
++
++/**
++ * Starts the local chain set up in `home`, serving JSON-RPC on 127.0.0.1:`rpc_port`.
++ * Stop it with `sequencer_ffi_stop_sequencer`.
++ *
++ * # Safety
++ * `home` must be a valid null-terminated C string.
++ */
++InitializedSequencerServiceFFIResult sequencer_ffi_start_local(const char *home, uint16_t rpc_port);
++
+ /**
+  * Initializes logging for the sequencer at `level`.
+  *
+diff --git a/lez/core_ffi/src/sequencer/api/local.rs b/lez/core_ffi/src/sequencer/api/local.rs
+new file mode 100644
+index 00000000..fa5a23cd
+--- /dev/null
++++ b/lez/core_ffi/src/sequencer/api/local.rs
+@@ -0,0 +1,117 @@
++//! A local, single-node dev chain inside the embedding process (LEZ Actors playground patch).
++//!
++//! `sequencer_ffi_local_setup` does what `sequencer_service setup --create-channel` does (write the
++//! config with its home, the channel signing key and the Bedrock funding public key);
++//! `sequencer_ffi_start_local` starts it with its JSON-RPC server on a fixed loopback port, so a
++//! wallet in the same process can talk to it like to any sequencer. Needs the `local-chain`
++//! feature (sequencer_service `rpc` + `standalone` + `prove`: no Bedrock node, no r0vm).
++use std::{
++    ffi::{CStr, c_char},
++    net::{Ipv4Addr, SocketAddr},
++    path::{Path, PathBuf},
++};
++
++use sequencer_service::SequencerConfig;
++
++use crate::{
++    error::FfiOperationError,
++    primitives::runtime::Runtime,
++    sequencer::{SequencerServiceFFI, api::lifecycle::InitializedSequencerServiceFFIResult},
++};
++
++const CONFIG_FILE: &str = "sequencer_config.json";
++
++unsafe fn path_arg(p: *const c_char) -> Result<PathBuf, FfiOperationError> {
++    if p.is_null() {
++        return Err(FfiOperationError::NullPointer);
++    }
++    unsafe { CStr::from_ptr(p) }
++        .to_str()
++        .map(PathBuf::from)
++        .map_err(|_| FfiOperationError::SequencerInitializationError)
++}
++
++fn setup(home: &Path, template: &Path, funding_public_key: &str) -> anyhow::Result<()> {
++    use anyhow::Context as _;
++    sequencer_core::parse_funding_public_key(funding_public_key).context("invalid funding public key")?;
++    std::fs::create_dir_all(home)?;
++    let home = home.canonicalize()?;
++    let file = std::fs::File::open(template).context("open the config template")?;
++    let mut config: SequencerConfig =
++        serde_json::from_reader(std::io::BufReader::new(file)).context("read the config template")?;
++    config.home.clone_from(&home);
++    let genesis = config.genesis.as_ref().context("the template needs a genesis")?;
++    sequencer_core::config::check_channel_params(&genesis.channel_params, config.block_create_timeout)?;
++    sequencer_core::load_or_create_signing_key(&home.join(sequencer_core::CHANNEL_SIGNING_KEY_FILE))?;
++    std::fs::write(home.join(sequencer_core::BEDROCK_FUNDING_PUBLIC_KEY_FILE), funding_public_key.trim())?;
++    std::fs::write(home.join(CONFIG_FILE), serde_json::to_string_pretty(&config)?)?;
++    Ok(())
++}
++
++/// Sets up a local chain's home from a config template (a genesis config, as in
++/// `configs/debug/sequencer_config.json`). A home that is already set up is left as it is.
++///
++/// # Safety
++/// All pointers must be valid null-terminated C strings.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn sequencer_ffi_local_setup(
++    home: *const c_char,
++    template_path: *const c_char,
++    funding_public_key: *const c_char,
++) -> FfiOperationError {
++    let (Ok(home), Ok(template)) = (unsafe { path_arg(home) }, unsafe { path_arg(template_path) }) else {
++        return FfiOperationError::NullPointer;
++    };
++    if funding_public_key.is_null() {
++        return FfiOperationError::NullPointer;
++    }
++    if home.join(CONFIG_FILE).exists() {
++        return FfiOperationError::Success;
++    }
++    let Ok(key) = unsafe { CStr::from_ptr(funding_public_key) }.to_str() else {
++        return FfiOperationError::SequencerInitializationError;
++    };
++    match setup(&home, &template, key) {
++        Ok(()) => FfiOperationError::Success,
++        Err(e) => {
++            eprintln!("[local-chain] setup failed: {e:#}");
++            FfiOperationError::SequencerInitializationError
++        }
++    }
++}
++
++/// Starts the local chain set up in `home`, serving JSON-RPC on 127.0.0.1:`rpc_port`.
++/// Stop it with `sequencer_ffi_stop_sequencer`.
++///
++/// # Safety
++/// `home` must be a valid null-terminated C string.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn sequencer_ffi_start_local(
++    home: *const c_char,
++    rpc_port: u16,
++) -> InitializedSequencerServiceFFIResult {
++    let start = || -> Result<SequencerServiceFFI, FfiOperationError> {
++        let home = unsafe { path_arg(home) }?;
++        let mut config = SequencerConfig::from_path(&home.join(CONFIG_FILE)).map_err(|e| {
++            eprintln!("[local-chain] can't read the config: {e:#}");
++            FfiOperationError::SequencerInitializationError
++        })?;
++        config.home.clone_from(&home);
++        let runtime = Runtime::new().map_err(|e| {
++            eprintln!("[local-chain] no tokio runtime: {e}");
++            FfiOperationError::SequencerInitializationError
++        })?;
++        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, rpc_port));
++        let handle = runtime
++            .block_on(sequencer_service::run(config, addr))
++            .map_err(|e| {
++                eprintln!("[local-chain] start failed: {e:#}");
++                FfiOperationError::SequencerInitializationError
++            })?;
++        Ok(SequencerServiceFFI::new(handle, runtime))
++    };
++    start().map_or_else(
++        InitializedSequencerServiceFFIResult::from_error,
++        InitializedSequencerServiceFFIResult::from_value,
++    )
++}
+diff --git a/lez/core_ffi/src/sequencer/api/mod.rs b/lez/core_ffi/src/sequencer/api/mod.rs
+index 9cb51e96..e61d0d75 100644
+--- a/lez/core_ffi/src/sequencer/api/mod.rs
++++ b/lez/core_ffi/src/sequencer/api/mod.rs
+@@ -1,3 +1,5 @@
+ pub mod lifecycle;
++#[cfg(feature = "local-chain")]
++pub mod local;
+ pub mod logging;
+ pub mod query;

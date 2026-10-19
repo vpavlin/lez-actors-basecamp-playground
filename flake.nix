@@ -22,7 +22,9 @@
         let
           pkgs = import nixpkgs { inherit system; overlays = logos-nix.lib.nativeOverlays ++ [ rust-overlay.overlays.default ]; };
           craneLib = (crane.mkLib pkgs).overrideToolchain (pkgs.rust-bin.fromRustupToolchainFile "${lez}/rust-toolchain.toml");
-          src = lez.outPath;
+          # patches/0001: an in-process local dev chain with its JSON-RPC (the wizard's "start a
+          # local chain"): sequencer_ffi_local_setup/_start_local behind the `local-chain` feature
+          src = pkgs.applyPatches { name = "lez-src-patched"; src = lez; patches = [ ./patches/0001-core-ffi-local-chain.patch ]; };
           cargoLock = builtins.fromTOML (builtins.readFile "${src}/Cargo.lock");
           r0rec = builtins.head (builtins.filter (p: p.name == "risc0-circuit-recursion") cargoLock.package);
           r0recCrate = pkgs.fetchurl {
@@ -39,7 +41,7 @@
             inherit src;
             pname = "lez-core-ffi";
             version = "0.1.0";
-            cargoExtraArgs = "-p core_ffi";
+            cargoExtraArgs = "-p core_ffi --features local-chain";
             doCheck = false;
             buildInputs = [ pkgs.openssl pkgs.pcsclite ];
             nativeBuildInputs = [ pkgs.pkg-config pkgs.clang pkgs.llvmPackages.libclang.lib pkgs.gnutar pkgs.python3 ];

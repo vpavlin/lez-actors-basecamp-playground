@@ -1,7 +1,7 @@
 {
  "name": "lez_actors_ui",
  "display_name": "LEZ Actors (playground)",
- "version": "0.1.1",
+ "version": "0.2.0",
  "type": "ui_qml",
  "category": "developer",
  "description": "Playground (experimental, may change or go away): Explore and call LEZ v0.4 actor programs: see each program's actor state on an account, call programs, send native transfers. Pure-QML view over lez_actors_module. Built on the Logos tech stack; not affiliated with Logos.",

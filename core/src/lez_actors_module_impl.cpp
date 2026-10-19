@@ -2,6 +2,7 @@
 #include "lez_actors_module_impl.h"
 #include "lez_http.hpp"
 #include "core_ffi.h"
+#include "lez_module_util.hpp"
 #include <QTimer>
 #include <openssl/evp.h>
 #include <chrono>
@@ -16,43 +17,11 @@
 namespace fs = std::filesystem;
 using lez::json;
 
+using namespace lezmod;
+
 namespace {
 
-long long nowMs() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-}
-std::string ok(json body = json::object()) { body["status"] = "ok"; return body.dump(); }
-std::string fail(const std::string& error) { return json{{"status", "error"}, {"error", error}}.dump(); }
-std::string unquote(std::string s) {   // logosctl/QML may pass a JSON-quoted string
-    if (s.size() >= 2 && s.front() == '"' && s.back() == '"') { json j = json::parse(s, nullptr, false); if (j.is_string()) return j.get<std::string>(); }
-    return s;
-}
-std::string homeDir() {
-    if (const char* h = getenv("HOME"); h && *h) return h;
-    if (passwd* pw = getpwuid(getuid())) return pw->pw_dir;
-    return ".";
-}
-bool writeAtomic(const std::string& path, const std::string& data) {
-    std::string tmp = path + ".tmp";
-    { std::ofstream f(tmp, std::ios::binary | std::ios::trunc); if (!f) return false; f << data; }
-    std::error_code ec; fs::rename(tmp, path, ec); return !ec;
-}
-lez::Id sha256Id(const std::string& prefix, const std::string& name) {
-    lez::Id out{}; unsigned int n = 0;
-    EVP_MD_CTX* c = EVP_MD_CTX_new();
-    EVP_DigestInit_ex(c, EVP_sha256(), nullptr);
-    EVP_DigestUpdate(c, prefix.data(), prefix.size());
-    EVP_DigestUpdate(c, name.data(), name.size());
-    EVP_DigestFinal_ex(c, out.data(), &n);
-    EVP_MD_CTX_free(c);
-    return out;
-}
-FfiBytes32 ffiId(const lez::Id& id) { FfiBytes32 b{}; std::copy(id.begin(), id.end(), b.data); return b; }
-lez::Id fromFfi(const FfiBytes32& b) { lez::Id id{}; std::copy(std::begin(b.data), std::end(b.data), id.begin()); return id; }
-std::string ffiErr(FfiOperationError e) { return "wallet error " + std::to_string(int(e)); }
-
 constexpr uint8_t kNativeTransferVariant = 0;      // native_token::Message::Transfer
-constexpr int kQuickOpTimeoutMs = 15000;
 constexpr long long kCreditWaitMs = 60000;          // async credits land a block or two later
 
 }  // namespace
@@ -66,11 +35,16 @@ LezActorsModuleImpl::~LezActorsModuleImpl() {
     m_qCv.notify_all();
     if (m_worker.joinable()) m_worker.join();
     if (m_wallet) { wallet_ffi_save(m_wallet); wallet_ffi_destroy(m_wallet); m_wallet = nullptr; }
+    if (m_chainThread.joinable()) m_chainThread.join();
+    if (m_chain) { sequencer_ffi_stop_sequencer(m_chain); m_chain = nullptr; }
     if (m_loop) { m_loop->stop(); delete m_loop; m_loop = nullptr; }
+    m_tap.stop();
 }
 
 void LezActorsModuleImpl::onContextReady() {
     std::lock_guard<std::recursive_mutex> lk(m_mtx);
+    // the wallet library and the local chain report details only on stdout/stderr
+    m_tap.start();
     setupDataDir();
     loadSettings();
     if (const char* u = getenv("LEZ_RPC_URL"); u && *u) m_rpcUrl = u;
@@ -118,6 +92,10 @@ void LezActorsModuleImpl::loadSettings() {
     m_rpcUrl = s.value("rpcUrl", m_rpcUrl);
     m_payer = s.value("payer", "");
     m_selected = s.value("selected", "");
+    for (const auto& a : s.value("helperAccounts", json::array())) if (a.is_string()) m_helperAccounts.push_back(a);
+    for (const auto& a : s.value("exampleAccounts", json::array())) if (a.is_string()) m_exampleAccounts.push_back(a);
+    if (s.contains("examplePrograms") && s["examplePrograms"].is_object())
+        for (auto it = s["examplePrograms"].begin(); it != s["examplePrograms"].end(); ++it) if (it.value().is_string()) m_examplePrograms[it.key()] = it.value();
     if (s.contains("programs") && s["programs"].is_array())
         for (const auto& p : s["programs"]) {
             auto id = lez::parseId(p.value("id", ""));
@@ -127,11 +105,16 @@ void LezActorsModuleImpl::loadSettings() {
 void LezActorsModuleImpl::saveSettings() {
     json progs = json::array();
     for (const auto& p : m_programs) if (!p.builtin) progs.push_back({{"name", p.name}, {"id", lez::b58(p.id)}});
-    writeAtomic(m_dataDir + "/settings.json", json{{"rpcUrl", m_rpcUrl}, {"payer", m_payer}, {"selected", m_selected}, {"programs", progs}}.dump(1));
+    writeAtomic(m_dataDir + "/settings.json", json{{"rpcUrl", m_rpcUrl}, {"payer", m_payer}, {"selected", m_selected}, {"programs", progs},
+                                                   {"helperAccounts", m_helperAccounts}, {"exampleAccounts", m_exampleAccounts},
+                                                   {"examplePrograms", m_examplePrograms}}.dump(1));
 }
 void LezActorsModuleImpl::writeWalletConfig() {
     // the wallet library's own config: where its sequencer is, and how long it polls
-    json c = {{"sequencer", {{"sequencer_addr", m_rpcUrl}}}, {"seq_poll_timeout", "30s"}, {"seq_tx_poll_max_blocks", 15},
+    // seq_poll_timeout is the delay BETWEEN inclusion polls (not a timeout); the window is
+    // seq_tx_poll_max_blocks polls. 1 s x 120: a tx returns about a second after it lands (30 s
+    // made each deploy segment wait half a minute), and slow sequencers still get two minutes.
+    json c = {{"sequencer", {{"sequencer_addr", m_rpcUrl}}}, {"seq_poll_timeout", "1s"}, {"seq_tx_poll_max_blocks", 120},
               {"seq_poll_max_retries", 10}, {"seq_block_poll_max_amount", 100}};
     writeAtomic(walletConfigPath(), c.dump(4));
 }
@@ -182,7 +165,11 @@ json LezActorsModuleImpl::buildSnapshot() {
         jobs.push_back({{"jobId", j.id}, {"kind", j.kind}, {"state", j.state}, {"error", j.error}, {"txHash", j.txHash}, {"request", j.request}, {"result", j.result}, {"createdMs", j.createdMs}, {"finishedMs", j.finishedMs}});
     }
     bool exists = fs::exists(walletStoragePath());
-    return {{"rpcUrl", m_rpcUrl}, {"payer", m_payer}, {"selected", m_selected}, {"wallet", {{"exists", exists}, {"open", m_wallet != nullptr}, {"accounts", m_accounts}}}, {"jobs", jobs}, {"dataDir", m_dataDir}};
+    std::vector<std::string> visible;
+    for (const auto& a : m_accounts) if (std::find(m_helperAccounts.begin(), m_helperAccounts.end(), a) == m_helperAccounts.end()) visible.push_back(a);
+    return {{"rpcUrl", m_rpcUrl}, {"payer", m_payer}, {"selected", m_selected}, {"wallet", {{"exists", exists}, {"open", m_wallet != nullptr}, {"accounts", visible}}},
+            {"jobs", jobs}, {"dataDir", m_dataDir}, {"exampleAccounts", m_exampleAccounts}, {"examplePrograms", m_examplePrograms},
+            {"localChain", {{"state", m_chainState}, {"error", m_chainError}, {"logSeq", m_tap.lastSeq()}}}};
 }
 
 std::string LezActorsModuleImpl::setEndpoint(std::string rpcUrl) {
@@ -245,7 +232,7 @@ std::string LezActorsModuleImpl::createWallet(std::string password) {
         std::string mnemonic = out.mnemonic ? out.mnemonic : "";
         if (out.mnemonic) primitives_ffi_free_cstring(out.mnemonic);
         wallet_ffi_save(out.wallet);
-        { std::lock_guard<std::recursive_mutex> lk(m_mtx); m_wallet = out.wallet; m_accounts.clear(); }
+        { std::lock_guard<std::recursive_mutex> lk(m_mtx); m_wallet = out.wallet; m_accounts.clear(); m_walletPw = password; }
         return {{"mnemonic", mnemonic}, {"note", "write the recovery phrase down; it is shown once"}};
     }, kQuickOpTimeoutMs);
     publish();
@@ -263,6 +250,7 @@ std::string LezActorsModuleImpl::unlockWallet(std::string password) {
         if (e != FfiOperationError_Success || !h) return {{"status", "error"}, {"error", e == FfiOperationError_WrongPassword ? "wrong password" : ffiErr(e)}};
         std::lock_guard<std::recursive_mutex> lk(m_mtx);
         m_wallet = h;
+        m_walletPw = password;
         return json::object();
     }, kQuickOpTimeoutMs);
     listAccounts();
@@ -333,7 +321,9 @@ std::string LezActorsModuleImpl::listAccounts() {
         std::lock_guard<std::recursive_mutex> lk(m_mtx);
         m_accounts = ids;
         if (m_payer.empty() && !ids.empty()) m_payer = ids.front();
-        return {{"accounts", ids}};
+        std::vector<std::string> visible;
+        for (const auto& a : ids) if (std::find(m_helperAccounts.begin(), m_helperAccounts.end(), a) == m_helperAccounts.end()) visible.push_back(a);
+        return {{"accounts", visible}};
     }, kQuickOpTimeoutMs);
     json j = json::parse(r, nullptr, false);
     if (j.is_object() && j.value("status", "") == "ok" && j.contains("accounts")) {
@@ -484,7 +474,7 @@ std::string LezActorsModuleImpl::startJob(const std::string& kind, const json& r
         Job copy;
         { std::lock_guard<std::recursive_mutex> lk(m_mtx); copy = m_jobs[id]; m_jobs[id].state = "running"; }
         onLoop([this] { publish(); });
-        if (kind == "call") runCall(copy); else runTransfer(copy);
+        if (kind == "call") runCall(copy); else if (kind == "deploy") runDeploy(copy); else if (kind == "example") runExample(copy); else runTransfer(copy);
         finishJob(id, [copy](Job& j) { j = copy; j.finishedMs = nowMs(); });
     });
     onLoop([this] { publish(); });
@@ -505,8 +495,10 @@ std::string LezActorsModuleImpl::job(std::string jobId) {
 
 // Sends one public v0.4 transaction through the wallet library and waits for inclusion.
 // mentions[0] is the root actor the message is delivered to. Returns the tx hash or "".
-static std::string sendPublic(WalletHandle* w, std::vector<std::pair<lez::Id, std::pair<lez::Id, bool>>> actors,
-                              const lez::Bytes& message, const lez::Id& payer, bool* included, std::string* err) {
+std::string LezActorsModuleImpl::sendPublic(std::vector<std::pair<lez::Id, std::pair<lez::Id, bool>>> actors,
+                                            const lez::Bytes& message, const lez::Id& payer, bool* included, std::string* err) {
+    WalletHandle* w = m_wallet;
+    long long seq = m_tap.lastSeq();
     std::vector<FfiAccountMention> mentions;
     for (const auto& [account, progSign] : actors) {
         FfiAccountMention m{};
@@ -524,7 +516,13 @@ static std::string sendPublic(WalletHandle* w, std::vector<std::pair<lez::Id, st
     FfiTransactionResult res{};
     FfiOperationError e = wallet_ffi_send_generic_public_transaction(w, mentions.data(), mentions.size(), 0, message.data(), message.size(), &p, &res);
     for (auto& x : mentions) wallet_ffi_free_account_identity(&x.identity);
-    if (e != FfiOperationError_Success || !res.tx_hash) { *err = "the wallet couldn't build or send the transaction (" + ffiErr(e) + "); the reason is in the host log, after [ffi]"; wallet_ffi_free_transaction_result(&res); return ""; }
+    if (e != FfiOperationError_Success || !res.tx_hash) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));   // let the tap read the library's stderr line
+        std::string why = m_tap.ffiErrorSince(seq);
+        *err = "the wallet couldn't build or send the transaction (" + ffiErr(e) + (why.empty() ? "); the reason is in the host log, after [ffi]" : "): " + why);
+        wallet_ffi_free_transaction_result(&res);
+        return "";
+    }
     std::string hash = res.tx_hash;
     wallet_ffi_free_transaction_result(&res);
     auto hb = lez::unhex(hash);
@@ -548,43 +546,82 @@ std::string LezActorsModuleImpl::callProgram(std::string requestJson) {
     return startJob("call", r);
 }
 
+// A call's request: either {programId, accountId, message, encoding, sign} (one actor), or
+// {actors: [{accountId, programId, sign}], messageHex} where actors[0] is the root and the rest are
+// the actors its tail calls reach (every touched actor is mentioned). Optional `expect`
+// ("applied"/"reverted") and `explain` come from a guided example step.
 void LezActorsModuleImpl::runCall(Job& j) {
     const json& r = j.request;
-    lez::Id prog = *lez::parseId(r.value("programId", r.value("programIdHex", "")));
-    lez::Id acct = *lez::parseId(r.value("accountId", r.value("accountIdHex", "")));
-    std::string enc = r.value("encoding", "hex"), msg = r.value("message", "");
-    lez::Bytes message = enc == "hex" ? *lez::unhex(msg) : enc == "text" ? lez::borshBytes(msg) : lez::Bytes(msg.begin(), msg.end());
-    bool sign = r.value("sign", false);
+    std::vector<std::pair<lez::Id, std::pair<lez::Id, bool>>> actors;
+    lez::Bytes message;
+    if (r.contains("actors")) {
+        for (const auto& a : r["actors"]) actors.push_back({*lez::parseId(a.value("accountId", "")), {*lez::parseId(a.value("programId", "")), a.value("sign", false)}});
+        message = *lez::unhex(r.value("messageHex", ""));
+    } else {
+        std::string enc = r.value("encoding", "hex"), msg = r.value("message", "");
+        message = enc == "hex" ? *lez::unhex(msg) : enc == "text" ? lez::borshBytes(msg) : lez::Bytes(msg.begin(), msg.end());
+        actors.push_back({*lez::parseId(r.value("accountId", r.value("accountIdHex", ""))), {*lez::parseId(r.value("programId", r.value("programIdHex", ""))), r.value("sign", false)}});
+    }
     lez::Id payer; { std::lock_guard<std::recursive_mutex> lk(m_mtx); payer = *lez::parseId(m_payer); }
-    if (sign && !walletHolds(acct)) { j.state = "failed"; j.error = "the account must be in this wallet to sign"; return; }
+    for (const auto& [acct, ps] : actors)
+        if (ps.second && !walletHolds(acct)) { j.state = "failed"; j.error = "the account must be in this wallet to sign"; return; }
 
-    std::string err; bool onChain = false;
-    auto before = fetchAccount(acct, &err, &onChain);
-    std::string pb58 = lez::b58(prog);
-    lez::Bytes stateBefore = before && before->actorStates.count(pb58) ? before->actorStates[pb58] : lez::Bytes{};
+    // every mentioned actor's state, before and after: a reverted call is still included and
+    // charged, and the state is the only way to tell
+    auto stateOf = [this](const lez::Id& acct, const lez::Id& prog) {
+        std::string err; bool oc = false;
+        auto v = fetchAccount(acct, &err, &oc);
+        std::string pb = lez::b58(prog);
+        return v && v->actorStates.count(pb) ? v->actorStates[pb] : lez::Bytes{};
+    };
+    std::vector<lez::Bytes> before;
+    for (const auto& [acct, ps] : actors) before.push_back(stateOf(acct, ps.first));
+    lez::Bytes payerBefore = stateOf(payer, lez::nativeTokenId());
+    long long seq = m_tap.lastSeq();
     j.state = "sending";
     bool included = false;
-    std::string hash = sendPublic(m_wallet, {{acct, {prog, sign}}}, message, payer, &included, &err);
+    std::string err;
+    std::string hash = sendPublic(actors, message, payer, &included, &err);
     if (hash.empty()) { j.state = "failed"; j.error = err; return; }
     j.txHash = hash;
     if (!included) { j.state = "failed"; j.error = "not included within the wallet's poll window"; return; }
-    // a reverted call is still included and charged: the state is the only way to tell
-    lez::Bytes stateAfter = stateBefore;
-    for (int i = 0; i < 6; i++) {
-        bool oc = false;
-        auto after = fetchAccount(acct, &err, &oc);
-        if (after && after->actorStates.count(pb58)) stateAfter = after->actorStates[pb58];
-        if (stateAfter != stateBefore) break;
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+    std::vector<lez::Bytes> after = before;
+    bool changed = false;
+    for (int i = 0; i < 6 && !changed; i++) {
+        if (i) std::this_thread::sleep_for(std::chrono::seconds(1));
+        for (size_t k = 0; k < actors.size(); k++) { after[k] = stateOf(actors[k].first, actors[k].second.first); if (after[k] != before[k]) changed = true; }
     }
-    bool changed = stateAfter != stateBefore;
-    json res = {{"included", true}, {"stateBefore", lez::hex(stateBefore)}, {"stateAfter", lez::hex(stateAfter)}, {"reverted", !changed}};
-    if (!sign && acct == payer) res["signedAsPayer"] = true;
-    if (auto t = lez::printable(stateBefore)) res["stateBeforeText"] = *t;
-    if (auto t = lez::printable(stateAfter)) res["stateAfterText"] = *t;
-    if (!changed) res["revertReason"] = "reverted, reason unavailable (it is in the sequencer's log); the fee was still charged";
+    lez::Bytes payerAfter = stateOf(payer, lez::nativeTokenId());
+    lez::u128 pb = lez::decodeU128le(payerBefore), pa = lez::decodeU128le(payerAfter);
+    json states = json::array();
+    for (size_t k = 0; k < actors.size(); k++) {
+        json s = {{"accountId", lez::b58(actors[k].first)}, {"programId", lez::b58(actors[k].second.first)}, {"signs", actors[k].second.second || actors[k].first == payer},
+                  {"before", lez::hex(before[k])}, {"after", lez::hex(after[k])}, {"changed", after[k] != before[k]}};
+        if (auto n = programName(lez::b58(actors[k].second.first)); !n.empty()) s["programName"] = n;
+        if (auto t = lez::printable(before[k])) s["beforeText"] = *t;
+        if (auto t = lez::printable(after[k])) s["afterText"] = *t;
+        states.push_back(s);
+    }
+    json res = {{"included", true}, {"reverted", !changed}, {"actors", states}, {"messageHex", lez::hex(message)}, {"payer", lez::b58(payer)},
+                {"fee", pb > pa ? lez::u128str(pb - pa) : "0"},
+                // the single-actor fields the first version had
+                {"stateBefore", lez::hex(before[0])}, {"stateAfter", lez::hex(after[0])}};
+    if (!actors[0].second.second && actors[0].first == payer) res["signedAsPayer"] = true;
+    if (auto t = lez::printable(before[0])) res["stateBeforeText"] = *t;
+    if (auto t = lez::printable(after[0])) res["stateAfterText"] = *t;
+    if (!changed) res["revertReason"] = revertReason(seq);
+    if (r.contains("expect")) res["asExpected"] = (r.value("expect", "") == "reverted") == !changed;
     j.result = res;
     j.state = changed ? "applied" : "reverted";
+}
+
+std::string LezActorsModuleImpl::revertReason(long long seq) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    std::string p = m_tap.panicSince(seq);
+    if (!p.empty()) return p + "; included and the fee was charged";
+    bool local; { std::lock_guard<std::recursive_mutex> lk(m_mtx); local = m_chain != nullptr; }
+    return local ? "reverted; no guest panic in the local chain's log; the fee was charged"
+                 : "reverted, reason unavailable (it is in the sequencer's log); the fee was still charged";
 }
 
 std::string LezActorsModuleImpl::transfer(std::string requestJson) {
@@ -632,7 +669,8 @@ void LezActorsModuleImpl::runTransfer(Job& j) {
     j.state = "sending";
     bool included = false;
     // the sender's native actor is the root; the recipient's native actor is touched by the credit
-    std::string hash = sendPublic(m_wallet, {{from, {lez::nativeTokenId(), true}}, {to, {lez::nativeTokenId(), false}}},
+    long long seq = m_tap.lastSeq();
+    std::string hash = sendPublic({{from, {lez::nativeTokenId(), true}}, {to, {lez::nativeTokenId(), false}}},
                                   lez::nativeTransferMessage(kNativeTransferVariant, to, amount), payer, &included, &err);
     if (hash.empty()) { j.state = "failed"; j.error = err; return; }
     j.txHash = hash;
@@ -656,6 +694,6 @@ void LezActorsModuleImpl::runTransfer(Job& j) {
                 {"senderBefore", lez::u128str(senderBefore)}, {"senderAfter", lez::u128str(senderAfter)},
                 {"recipientBefore", lez::u128str(recipientBefore)}, {"recipientAfter", lez::u128str(recipientAfter)}, {"payer", lez::b58(payer)}};
     if (outcome == lez::TransferOutcome::Moved) j.state = "applied";
-    else if (outcome == lez::TransferOutcome::Reverted) { j.state = "reverted"; j.result["reverted"] = true; j.result["revertReason"] = "reverted, reason unavailable (it is in the sequencer's log); nothing credited, the fee was charged"; }
+    else if (outcome == lez::TransferOutcome::Reverted) { j.state = "reverted"; j.result["reverted"] = true; j.result["revertReason"] = revertReason(seq) + "; nothing credited"; }
     else { j.state = "unknown"; j.error = "neither balance changed within a minute"; }
 }

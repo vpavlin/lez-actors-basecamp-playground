@@ -1,6 +1,7 @@
 // Unit tests for the pure helpers (ids, balances, actor states, messages, fees).
 // g++ -std=c++20 -I../src -I<nlohmann include> codec_test.cpp -o codec_test && ./codec_test
 #include "lez_codec.hpp"
+#include "lez_examples.hpp"
 #include <cstdio>
 static int fails = 0, passes = 0;
 #define CHECK(c, m) do { if (c) passes++; else { fails++; std::printf("FAIL: %s\n", m); } } while (0)
@@ -36,6 +37,18 @@ int main() {
     CHECK(transferOutcome(100, 100, 0, 0, 40) == TransferOutcome::Unchanged, "unchanged");
     auto hx = unhex("0x0001ff");
     CHECK(hx && hex(*hx) == "0001ff", "hex round trip, 0x prefix");
+    // the example programs' borsh messages
+    Bytes ab{'a', 'b'};
+    CHECK(hex(moveFnWrite(ab)) == "00020000006162", "move_function Write(Vec): variant 0 + vec");
+    Id dst{}; dst[0] = 7; dst[31] = 9;
+    Bytes md = moveFnMoveData(ab, dst);
+    CHECK(md.size() == 1 + 4 + 2 + 32 && md[0] == 1 && md[7] == 7 && md[38] == 9, "move_function MoveData{data, to}: variant 1 + vec + 32-byte id");
+    CHECK(hex(moveFnAppend(ab)).substr(0, 2) == "02", "move_function Append: variant 2");
+    Id acct{}; acct[0] = 0xaa; Id prg{}; prg[0] = 0xbb;
+    Bytes act = actorBytes(acct, prg);
+    CHECK(act.size() == 64 && act[0] == 0xaa && act[32] == 0xbb, "Actor: account id then program id, 64 bytes");
+    CHECK(examples().size() == 4 && findExample("simple_tail_call") && findExample("simple_tail_call")->needs.size() == 1, "example catalog");
+    for (const auto& e : examples()) for (const auto& st : e.steps) CHECK(st.expect == "applied" || st.expect == "reverted", "every step states its expected outcome");
     std::printf("%d passed, %d failed\n", passes, fails);
     return fails ? 1 : 0;
 }

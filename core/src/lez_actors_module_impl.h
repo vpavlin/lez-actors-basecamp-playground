@@ -24,9 +24,11 @@
 #include <thread>
 #include "logos_module_context.h"
 #include "lez_codec.hpp"
+#include "lez_logtap.hpp"
 
 class QTimer;
 struct WalletHandle;
+struct SequencerServiceFFI;
 
 class LezActorsModuleImpl : public LogosModuleContext {
 public:
@@ -62,6 +64,19 @@ public:
     std::string transfer(std::string requestJson);
     std::string job(std::string jobId);
 
+    // --- a local v0.4 chain inside this module (the wizard) ---
+    std::string localChainStatus();
+    std::string startLocalChain();
+    std::string stopLocalChain();
+    std::string resetLocalChain();
+    std::string localChainLog(std::string sinceSeq);
+    std::string useDevAccounts();
+
+    // --- the guided examples (LEZ's program-deployment tutorial programs, embedded) ---
+    std::string listExamples();
+    std::string deployExample(std::string name);
+    std::string runExampleStep(std::string requestJson);
+
 protected:
     void onContextReady() override;
 
@@ -90,6 +105,14 @@ private:
     void workerLoop();
     void runCall(Job& j);
     void runTransfer(Job& j);
+    void runDeploy(Job& j);
+    void runExample(Job& j);
+    std::string sendPublic(std::vector<std::pair<lez::Id, std::pair<lez::Id, bool>>> actors, const lez::Bytes& message,
+                           const lez::Id& payer, bool* included, std::string* err);
+    std::string revertReason(long long logSeqBefore);
+    std::vector<std::string> ensureExampleAccounts(std::string* err);
+    std::optional<lez::Id> exampleProgram(const std::string& name);
+    void startChainThread(bool reset);
     std::string startJob(const std::string& kind, const lez::json& request);
     void finishJob(const std::string& id, std::function<void(Job&)> update);
 
@@ -115,6 +138,19 @@ private:
     // wallet (touched only on the worker thread, except the handle pointer under m_mtx)
     WalletHandle* m_wallet = nullptr;
     std::vector<std::string> m_accounts;
+    // kept while the wallet is unlocked, only to reopen it when the sequencer address changes
+    // (the wallet library reads that address at open)
+    std::string m_walletPw;
+    std::vector<std::string> m_helperAccounts;     // deploy header/segment accounts: not listed
+    std::vector<std::string> m_exampleAccounts;    // "example account 1/2"
+    std::map<std::string, std::string> m_examplePrograms;   // example name -> deployed program id
+
+    // the local chain
+    lez::LogTap m_tap;
+    SequencerServiceFFI* m_chain = nullptr;
+    std::string m_chainState = "stopped";   // stopped | starting | running | stopping | failed | external
+    std::string m_chainError;
+    std::thread m_chainThread;
 
     QTimer* m_loop = nullptr;
     std::thread m_worker;

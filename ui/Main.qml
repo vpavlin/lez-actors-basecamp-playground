@@ -36,6 +36,13 @@ Item {
     property string toastMsg: ""
     property bool toastErr: false
     property var watched: ({})       // jobId -> already reported in a toast
+    property var examples: []        // listExamples().examples
+    property var chainLog: []        // localChainLog() lines
+    property int chainLogSeq: 0
+    property bool showLog: false
+    property var stepText: ({})      // "example/step" -> edited text
+    readonly property var chain: root.st.localChain || ({})
+    readonly property bool walletOpen: !!(root.st.wallet && root.st.wallet.open)
 
     // ── calls ──────────────────────────────────────────────────────────────────
     function callVia(mod, method, args, cb) {
@@ -82,13 +89,24 @@ Item {
         busyGuard.restart()
         var sel = root.st.selected || ""
         var walletOpen = !!(root.st.wallet && root.st.wallet.open)
-        var pending = 3 + (walletOpen ? 1 : 0) + (sel ? 1 : 0)
+        var guided = tabs.currentIndex === 0
+        var pending = 3 + (walletOpen ? 1 : 0) + (sel ? 1 : 0) + (guided ? 1 : 0) + (root.showLog ? 1 : 0)
         var fin = function () { if (--pending > 0) return; root.busy = false; if (root.again) { root.again = false; root.refresh() } }
         root.core("snapshot", [], function (raw) { var s = root.parse(raw); if (s && s.status === "ok") { root.st = s; root.reportJobs(s.jobs || []) } fin() })
         root.core("health", [], function (raw) { var h = root.parse(raw); if (h) root.hl = h; fin() })
         root.core("listKnownPrograms", [], function (raw) { var p = root.parse(raw); if (p && p.status === "ok") root.programs = p.programs; fin() })
         if (walletOpen) root.core("listAccounts", [], function (raw) { var a = root.parse(raw); if (a && a.status === "ok") root.accounts = a.accounts; fin() })
         if (sel) root.core("getAccount", [sel], function (raw) { var d = root.parse(raw); if (d && d.status === "ok") root.detail = d; fin() })
+        if (guided) root.core("listExamples", [], function (raw) { var e = root.parse(raw); if (e && e.status === "ok") root.examples = e.examples; fin() })
+        if (root.showLog) root.core("localChainLog", [String(root.chainLogSeq)], function (raw) {
+            var l = root.parse(raw)
+            if (l && l.status === "ok" && l.lines.length) {
+                var all = root.chainLog.concat(l.lines)
+                root.chainLog = all.slice(Math.max(0, all.length - 300))
+                root.chainLogSeq = l.lastSeq
+            }
+            fin()
+        })
     }
     // a finished job is reported once: applied in green, reverted / failed in red - never a
     // success toast for a transaction that reverted
@@ -98,12 +116,40 @@ Item {
             if (["applied", "reverted", "failed", "unknown"].indexOf(j.state) < 0 || root.watched[j.jobId]) continue
             var w = root.watched; w[j.jobId] = true; root.watched = w
             if (!j.finishedMs || Date.now() - j.finishedMs > 120000) continue   // old, from before this view opened
-            var what = j.kind === "call" ? "Call" : "Transfer"
+            var what = root.jobTitle(j)
             if (j.state === "applied") root.toast(what + " applied" + (j.result && j.result.fee ? " (fee " + root.units(j.result.fee) + ")" : ""), false)
             else if (j.state === "reverted") root.toast(what + " reverted: " + ((j.result && j.result.revertReason) || "reason unavailable"), true)
             else root.toast(what + " failed: " + (j.error || "unknown"), true)
         }
     }
+    function jobTitle(j) {
+        if (j.kind === "example") return j.request.example + ": " + j.request.label
+        if (j.kind === "deploy") return "Deploy " + j.request.example
+        return j.kind === "call" ? "Call" : "Transfer"
+    }
+    // the latest job of an example step, or null
+    function lastStepJob(ex, step) {
+        var jobs = root.st.jobs || []
+        for (var i = 0; i < jobs.length; i++) if (jobs[i].kind === "example" && jobs[i].request.example === ex && jobs[i].request.step === step) return jobs[i]
+        return null
+    }
+    function lastDeployJob(ex) {
+        var jobs = root.st.jobs || []
+        for (var i = 0; i < jobs.length; i++) if (jobs[i].kind === "deploy" && jobs[i].request.example === ex) return jobs[i]
+        return null
+    }
+    function payerBalance() {
+        for (var i = 0; i < root.accounts.length; i++) if (root.accounts[i].accountId === root.st.payer) return root.accounts[i].onChain ? root.units(root.accounts[i].balance) + " raw units" : "off-chain (fund it, or use the dev accounts)"
+        return ""
+    }
+    function accountLabel(id) {
+        var ex = root.st.exampleAccounts || []
+        if (id === ex[0]) return "example account 1"
+        if (id === ex[1]) return "example account 2"
+        return root.shortId(id)
+    }
+    function stateColor(state) { return state === "applied" ? root.cOk : (["reverted", "failed", "unknown"].indexOf(state) >= 0 ? root.cErr : root.cWarn) }
+    function bytesText(hex, text) { return text !== undefined ? "“" + text + "”" : (hex ? "0x" + hex : "(empty)") }
     Timer { id: busyGuard; interval: 30000; onTriggered: root.busy = false }
     Timer { interval: 3000; running: true; repeat: true; onTriggered: root.refresh() }
     Timer { id: toastTimer; interval: 6000; onTriggered: root.toastMsg = "" }
@@ -166,7 +212,7 @@ Item {
                     color: root.hl.reachable ? root.cText2 : root.cErr
                     text: root.hl.reachable
                           ? "Connected - block " + root.hl.blockHeight + "  -  base fees: execution " + root.hl.baseFeeExec + ", storage " + root.hl.baseFeeStor + " (raw units per gas / per byte)"
-                          : "Not reachable: " + (root.hl.error || "...") + "\nStart a local v0.4 sequencer: RISC0_DEV_MODE=1 just run-sequencer-standalone (LEZ dev), or prog-tui."
+                          : "Not reachable: " + (root.hl.error || "...") + "\nStart the local chain in Guided below, or run a v0.4 sequencer yourself (LEZ dev, standalone)."
                 }
             }
 
@@ -200,6 +246,211 @@ Item {
                 LogosButton { text: "I wrote it down"; onClicked: mnemonicBox.text = "" }
             }
 
+            TabBar {
+                id: tabs
+                Layout.fillWidth: true
+                currentIndex: 0
+                onCurrentIndexChanged: root.refresh()
+                TabButton { text: "Guided: deploy and run the v0.4 examples" }
+                TabButton { text: "Explorer: accounts, any program, transfers" }
+            }
+
+            // ── Guided: the wizard ─────────────────────────────────────────────────
+            ColumnLayout {
+                objectName: "guided"
+                visible: tabs.currentIndex === 0
+                Layout.fillWidth: true
+                spacing: root.sp
+
+                // 1. the local chain
+                Card {
+                    objectName: "chainCard"
+                    border.color: root.chain.state === "running" || root.chain.state === "external" ? root.cOk : root.chain.state === "failed" ? root.cErr : root.cLine
+                    RowLayout {
+                        Layout.fillWidth: true
+                        T1 { text: "1. A local v0.4 chain"; Layout.fillWidth: true }
+                        T2 {
+                            text: root.chain.state === "running" ? "running in this app, on 127.0.0.1:3040"
+                                  : root.chain.state === "external" ? "using the sequencer already on 127.0.0.1:3040"
+                                  : root.chain.state || "stopped"
+                            color: root.chain.state === "running" || root.chain.state === "external" ? root.cOk : root.chain.state === "failed" ? root.cErr : root.cWarn
+                        }
+                    }
+                    T2 {
+                        Layout.fillWidth: true
+                        text: "A single-node LEZ sequencer (LEZ dev, the actor model) running inside this app: no Docker, no Bedrock node, nothing to download. "
+                              + "Guests run without real proofs (RISC0_DEV_MODE), and its genesis funds two dev accounts. A block every 3 seconds. Its data stays in the app's folder until you reset it."
+                    }
+                    T2 { visible: !!root.chain.error; Layout.fillWidth: true; color: root.cErr; text: root.chain.error || "" }
+                    RowLayout {
+                        LogosButton { text: "Start"; enabled: ["stopped", "failed", undefined].indexOf(root.chain.state) >= 0; onClicked: root.act("startLocalChain", [], "Starting the local chain...") }
+                        LogosButton { text: "Stop"; enabled: root.chain.state === "running" || root.chain.state === "external"; onClicked: root.act("stopLocalChain", [], "Stopping") }
+                        LogosButton { text: "Reset (fresh genesis)"; enabled: root.chain.state !== "starting" && root.chain.state !== "stopping" && root.chain.state !== "external"; onClicked: root.act("resetLocalChain", [], "Deleting the local chain; start it again for a fresh one") }
+                        LogosButton { text: root.showLog ? "Hide log" : "Show log"; onClicked: { root.showLog = !root.showLog; root.refresh() } }
+                        T3 { Layout.fillWidth: true; text: root.hl.reachable ? "block " + root.hl.blockHeight : "" }
+                    }
+                    Rectangle {
+                        visible: root.showLog
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 260
+                        color: root.cInset; radius: root.rad; border.color: root.cLine
+                        ScrollView {
+                            id: logScroll
+                            anchors.fill: parent; anchors.margins: 6
+                            clip: true
+                            Mono {
+                                id: logText
+                                width: logScroll.availableWidth
+                                font.pixelSize: 11
+                                text: root.chainLog.length ? root.chainLog.map(function (l) { return l.text }).join("\n") : "(nothing yet)"
+                                onTextChanged: Qt.callLater(function () { if (logScroll.ScrollBar.vertical) logScroll.ScrollBar.vertical.position = 1.0 - logScroll.ScrollBar.vertical.size })
+                            }
+                        }
+                    }
+                }
+
+                // 2. the wallet (the card above does the work)
+                Card {
+                    T1 { text: "2. A wallet" }
+                    T2 {
+                        Layout.fillWidth: true
+                        color: root.walletOpen ? root.cOk : root.cText2
+                        text: root.walletOpen ? "Unlocked. It signs and pays for everything below."
+                                              : "Create (or unlock) a wallet in the card above. It holds the keys that sign and pay; in v0.4 every transaction declares a fee and its payer signs."
+                    }
+                }
+
+                // 3. the dev accounts
+                Card {
+                    T1 { text: "3. Funded accounts" }
+                    T2 {
+                        Layout.fillWidth: true
+                        text: "The dev genesis funds two public accounts (LEZ's own test keys). Importing them gives the wallet something to pay fees with; the 20 T one becomes the payer. "
+                              + "The examples then run on two fresh accounts of their own (example accounts 1 and 2), which never pay, so whether they sign is up to each step."
+                    }
+                    RowLayout {
+                        LogosButton { text: "Use the dev accounts"; enabled: root.walletOpen && root.hl.reachable; onClicked: root.act("useDevAccounts", [], "Dev accounts imported; the 20 T one pays") }
+                        T3 {
+                            Layout.fillWidth: true
+                            text: root.st.payer ? "payer " + root.shortId(root.st.payer) + (root.accounts.length ? "  -  " + root.payerBalance() : "") : "no payer yet"
+                        }
+                    }
+                    T3 {
+                        visible: (root.st.exampleAccounts || []).length > 0
+                        Layout.fillWidth: true
+                        text: "example account 1: " + ((root.st.exampleAccounts || [])[0] || "") + "\nexample account 2: " + ((root.st.exampleAccounts || [])[1] || "")
+                        font.family: "monospace"
+                    }
+                }
+
+                // 4. the examples
+                T1 { text: "4. The examples: LEZ's program-deployment tutorial programs"; Layout.topMargin: root.spS }
+                T2 {
+                    Layout.fillWidth: true
+                    text: "Each is a real RISC Zero guest from LEZ (examples/program_deployment), built into this app. Deploy uploads it through the program loader: the bytecode goes into segment accounts and a header account points at them; "
+                          + "the header's id is the program's id. Every step says what it should do; the result shows each mentioned actor's state before and after, the fee, and, for a revert, the guest's panic message from the chain's log."
+                }
+                Repeater {
+                    model: root.examples
+                    delegate: Card {
+                        id: exCard
+                        required property var modelData
+                        readonly property var deployJob: root.lastDeployJob(modelData.name)
+                        readonly property bool deploying: !!deployJob && ["applied", "failed", "reverted", "unknown"].indexOf(deployJob.state) < 0
+                        border.color: modelData.deployed ? root.cLine : root.cWarn
+                        RowLayout {
+                            Layout.fillWidth: true
+                            T1 { text: exCard.modelData.title; Layout.fillWidth: true }
+                            T3 { text: exCard.modelData.deployed ? "deployed: " + exCard.modelData.programId : Math.round(exCard.modelData.elfSize / 1024) + " KB guest"; font.family: "monospace" }
+                        }
+                        T2 { Layout.fillWidth: true; text: exCard.modelData.about }
+                        T3 { visible: exCard.modelData.needs.length > 0; Layout.fillWidth: true; text: "calls " + exCard.modelData.needs.join(", ") + ": deploying this deploys that too" }
+                        RowLayout {
+                            visible: !exCard.modelData.deployed
+                            LogosButton {
+                                text: exCard.deploying ? "Deploying..." : "Deploy"
+                                enabled: !exCard.deploying && root.walletOpen && !!root.st.payer && root.hl.reachable
+                                onClicked: root.act("deployExample", [exCard.modelData.name], "Deploying " + exCard.modelData.name + " (a few blocks)")
+                            }
+                            T3 {
+                                Layout.fillWidth: true
+                                color: exCard.deployJob && exCard.deployJob.state === "failed" ? root.cErr : root.cText3
+                                text: exCard.deployJob ? (exCard.deployJob.state === "failed" ? exCard.deployJob.error : exCard.deployJob.state) : (root.st.payer ? "fee paid by " + root.shortId(root.st.payer) : "needs a payer (step 3)")
+                            }
+                        }
+                        Repeater {
+                            model: exCard.modelData.deployed ? exCard.modelData.steps : []
+                            delegate: Rectangle {
+                                id: stepBox
+                                required property var modelData
+                                readonly property string key: exCard.modelData.name + "/" + modelData.id
+                                readonly property var job: root.lastStepJob(exCard.modelData.name, modelData.id)
+                                readonly property bool running: !!job && ["applied", "failed", "reverted", "unknown"].indexOf(job.state) < 0
+                                Layout.fillWidth: true
+                                implicitHeight: stepCol.implicitHeight + 16
+                                color: root.cInset; radius: root.rad; border.color: root.cLine
+                                ColumnLayout {
+                                    id: stepCol
+                                    anchors.fill: parent; anchors.margins: 8
+                                    spacing: 4
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        T2 { text: stepBox.modelData.label; color: root.cText; font.weight: Font.DemiBold; Layout.fillWidth: true }
+                                        T3 { text: "expected: " + stepBox.modelData.expect; color: stepBox.modelData.expect === "applied" ? root.cOk : root.cErr }
+                                    }
+                                    T3 { Layout.fillWidth: true; text: stepBox.modelData.explain }
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        Field {
+                                            id: stepField
+                                            visible: stepBox.modelData.takesText
+                                            placeholderText: "message text"
+                                            Component.onCompleted: text = root.stepText[stepBox.key] !== undefined ? root.stepText[stepBox.key] : stepBox.modelData.defaultText
+                                            onTextChanged: { var t = root.stepText; t[stepBox.key] = text; root.stepText = t }
+                                        }
+                                        Item { visible: !stepBox.modelData.takesText; Layout.fillWidth: true }
+                                        LogosButton {
+                                            text: stepBox.running ? "Running..." : "Run"
+                                            enabled: !stepBox.running && root.walletOpen && !!root.st.payer
+                                            onClicked: root.act("runExampleStep", [JSON.stringify({ example: exCard.modelData.name, step: stepBox.modelData.id, text: stepField.text })], "Sent - waiting for the chain")
+                                        }
+                                    }
+                                    // the outcome
+                                    RowLayout {
+                                        visible: !!stepBox.job
+                                        Layout.fillWidth: true
+                                        T2 { text: stepBox.job ? stepBox.job.state : ""; color: root.stateColor(stepBox.job ? stepBox.job.state : "") }
+                                        T3 {
+                                            visible: !!(stepBox.job && stepBox.job.result && stepBox.job.result.asExpected !== undefined)
+                                            text: stepBox.job && stepBox.job.result && stepBox.job.result.asExpected ? "as expected" : "NOT what was expected"
+                                            color: stepBox.job && stepBox.job.result && stepBox.job.result.asExpected ? root.cOk : root.cErr
+                                        }
+                                        T3 { visible: !!(stepBox.job && stepBox.job.result && stepBox.job.result.fee); text: stepBox.job && stepBox.job.result ? "fee " + root.units(stepBox.job.result.fee) : "" }
+                                        Item { Layout.fillWidth: true }
+                                    }
+                                    T3 { visible: !!(stepBox.job && stepBox.job.error); Layout.fillWidth: true; color: root.cErr; text: stepBox.job ? stepBox.job.error || "" : "" }
+                                    T3 { visible: !!(stepBox.job && stepBox.job.result && stepBox.job.result.revertReason); Layout.fillWidth: true; color: root.cErr; text: stepBox.job && stepBox.job.result ? "revert: " + (stepBox.job.result.revertReason || "") : "" }
+                                    Repeater {
+                                        model: stepBox.job && stepBox.job.result && stepBox.job.result.actors ? stepBox.job.result.actors : []
+                                        delegate: T3 {
+                                            required property var modelData
+                                            required property int index
+                                            Layout.fillWidth: true
+                                            color: modelData.changed ? root.cText : root.cText3
+                                            text: (index === 0 ? "root actor  " : "mentioned   ") + "(" + root.accountLabel(modelData.accountId) + ", " + (modelData.programName || root.shortId(modelData.programId)) + ")"
+                                                  + (modelData.signs ? "  signs" : "") + "\n    " + root.bytesText(modelData.before, modelData.beforeText) + "  →  " + root.bytesText(modelData.after, modelData.afterText)
+                                            font.family: "monospace"
+                                        }
+                                    }
+                                    T3 { visible: !!(stepBox.job && stepBox.job.result && stepBox.job.result.messageHex); Layout.fillWidth: true; text: stepBox.job && stepBox.job.result ? "message (borsh) 0x" + stepBox.job.result.messageHex : ""; font.family: "monospace"; wrapMode: Text.WrapAnywhere }
+                                    T3 { visible: !!(stepBox.job && stepBox.job.txHash); Layout.fillWidth: true; text: stepBox.job ? "tx " + stepBox.job.txHash : ""; font.family: "monospace" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             GridLayout {
                 id: panes
                 // two columns when there is room, stacked otherwise
@@ -207,7 +458,7 @@ Item {
                 Layout.fillWidth: true
                 columns: twoCol ? 2 : 1
                 columnSpacing: root.sp; rowSpacing: root.sp
-                visible: !!(root.st.wallet && root.st.wallet.open)
+                visible: tabs.currentIndex === 1 && root.walletOpen
 
                 // ── left: accounts + programs ──
                 // a nested layout fills by default and its implicit width (long placeholders)
@@ -402,17 +653,19 @@ Item {
                                 RowLayout {
                                     Layout.fillWidth: true
                                     T2 {
-                                        text: (modelData.kind === "call" ? "call " + root.shortId(modelData.request.programId) : "transfer " + root.units(modelData.request.amount) + " → " + root.shortId(modelData.request.to))
+                                        text: modelData.kind === "call" ? "call " + root.shortId(modelData.request.programId)
+                                              : modelData.kind === "transfer" ? "transfer " + root.units(modelData.request.amount) + " → " + root.shortId(modelData.request.to)
+                                              : root.jobTitle(modelData)
                                         color: root.cText; Layout.fillWidth: true
                                     }
                                     T2 {
                                         text: modelData.state
-                                        color: modelData.state === "applied" ? root.cOk : (["reverted", "failed", "unknown"].indexOf(modelData.state) >= 0 ? root.cErr : root.cWarn)
+                                        color: root.stateColor(modelData.state)
                                     }
                                 }
                                 T3 { visible: !!modelData.txHash; text: "tx " + modelData.txHash; font.family: "monospace"; Layout.fillWidth: true }
                                 T3 {
-                                    visible: modelData.kind === "call" && !!modelData.result && modelData.result.stateAfter !== undefined
+                                    visible: (modelData.kind === "call" || modelData.kind === "example") && !!modelData.result && modelData.result.stateAfter !== undefined
                                     Layout.fillWidth: true
                                     text: modelData.result ? "state " + (modelData.result.stateBeforeText !== undefined ? "“" + modelData.result.stateBeforeText + "”" : "0x" + modelData.result.stateBefore)
                                           + " → " + (modelData.result.stateAfterText !== undefined ? "“" + modelData.result.stateAfterText + "”" : "0x" + modelData.result.stateAfter) : ""
