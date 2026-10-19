@@ -86,6 +86,18 @@ if [ -n "${HELLO_PROGRAM:-}" ]; then
   G=$(call getAccount str:$NEW); echo "$G" | grep -q '"programName": "hello_world"'; check $? "the account shows a hello_world actor state, labelled"
 fi
 
+if [ -n "${AUTH_PROGRAM:-}" ]; then
+  echo "== hello_world_with_authorization ($AUTH_PROGRAM): unsigned must revert, signed must apply"
+  call addProgram "str:{\"name\":\"hello_auth\",\"programId\":\"$AUTH_PROGRAM\"}" >/dev/null
+  waitjob() { local J S; for i in $(seq 1 60); do J=$(call job str:$1); S=$(echo "$J" | field state); case "$S" in applied|reverted|failed|unknown) break;; esac; sleep 2; done; echo "$J"; }
+  C=$(call callProgram "str:{\"programId\":\"$AUTH_PROGRAM\",\"accountId\":\"$NEW\",\"message\":\"no signature\",\"encoding\":\"text\",\"sign\":false}")
+  J=$(waitjob "$(echo "$C" | field jobId)"); echo "  job: $J" | cut -c1-300
+  [ "$(echo "$J" | field state)" = reverted ] && [ "$(echo "$J" | field result.reverted)" = True ]; check $? "an unsigned call is reported REVERTED (included and charged, state unchanged), not applied"
+  C=$(call callProgram "str:{\"programId\":\"$AUTH_PROGRAM\",\"accountId\":\"$NEW\",\"message\":\"signed\",\"encoding\":\"text\",\"sign\":true}")
+  J=$(waitjob "$(echo "$C" | field jobId)"); echo "  job: $J" | cut -c1-300
+  [ "$(echo "$J" | field state)" = applied ] && [ "$(echo "$J" | field result.stateAfterText)" = "signed" ]; check $? "the signed call is applied"
+fi
+
 ctl daemon stop >/dev/null
 echo "$pass passed, $fail failed"
 [ "$fail" = 0 ]
