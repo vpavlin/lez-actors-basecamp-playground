@@ -71,7 +71,7 @@ Item {
         for (var i = 0; i < s.length; i++) { if (i > 0 && (s.length - i) % 3 === 0) out += " "; out += s[i] }
         return out
     }
-    function short(id) { id = String(id || ""); return id.length > 14 ? id.slice(0, 6) + "…" + id.slice(-6) : id }
+    function shortId(id) { id = String(id || ""); return id.length > 14 ? id.slice(0, 6) + "…" + id.slice(-6) : id }
     function programLabel(pid) { for (var i = 0; i < root.programs.length; i++) if (root.programs[i].programId === pid) return root.programs[i].name; return "" }
 
     property bool busy: false
@@ -200,14 +200,22 @@ Item {
                 LogosButton { text: "I wrote it down"; onClicked: mnemonicBox.text = "" }
             }
 
-            RowLayout {
+            GridLayout {
+                id: panes
+                // two columns when there is room, stacked otherwise
+                readonly property bool twoCol: width >= 1000
                 Layout.fillWidth: true
-                spacing: root.sp
+                columns: twoCol ? 2 : 1
+                columnSpacing: root.sp; rowSpacing: root.sp
                 visible: !!(root.st.wallet && root.st.wallet.open)
 
                 // ── left: accounts + programs ──
+                // a nested layout fills by default and its implicit width (long placeholders)
+                // would squeeze the right column to nothing: pin it when side by side
                 ColumnLayout {
-                    Layout.preferredWidth: 420
+                    Layout.fillWidth: !panes.twoCol
+                    Layout.preferredWidth: panes.twoCol ? 520 : -1
+                    Layout.maximumWidth: panes.twoCol ? 520 : Number.POSITIVE_INFINITY
                     Layout.alignment: Qt.AlignTop
                     spacing: root.sp
                     Card {
@@ -229,7 +237,7 @@ Item {
                                 RowLayout {
                                     id: arow
                                     anchors.fill: parent; anchors.margins: 4
-                                    T2 { text: (modelData.accountId === root.st.payer ? "★ " : "  ") + (modelData.accountId === root.st.selected ? "▶ " : "  ") + root.short(modelData.accountId); font.family: "monospace" }
+                                    T2 { text: (modelData.accountId === root.st.payer ? "★ " : "  ") + (modelData.accountId === root.st.selected ? "▶ " : "  ") + root.shortId(modelData.accountId); font.family: "monospace" }
                                     T2 { Layout.fillWidth: true; horizontalAlignment: Text.AlignRight; text: modelData.onChain ? root.units(modelData.balance) : "off-chain"; color: modelData.onChain ? root.cText : root.cText3 }
                                     LogosButton { text: "Show"; onClicked: root.act("setSelected", [modelData.accountId], "") }
                                     LogosButton { text: "Pay with"; enabled: modelData.accountId !== root.st.payer; onClicked: root.act("setPayer", [modelData.accountId], "Payer set") }
@@ -252,7 +260,7 @@ Item {
                                 required property var modelData
                                 Layout.fillWidth: true
                                 T2 { text: modelData.name; color: modelData.builtin ? root.cText3 : root.cText; Layout.preferredWidth: 130; elide: Text.ElideRight }
-                                T3 { text: root.short(modelData.programId); font.family: "monospace"; Layout.fillWidth: true }
+                                T3 { text: root.shortId(modelData.programId); font.family: "monospace"; Layout.fillWidth: true }
                                 LogosButton { text: "Call"; visible: !modelData.builtin; onClicked: root.callProgramId = modelData.programId }
                                 LogosButton { text: "Remove"; visible: !modelData.builtin; onClicked: root.act("removeProgram", [modelData.programId], "Removed") }
                             }
@@ -278,6 +286,7 @@ Item {
                 // ── right: account detail, call, transfer, activity ──
                 ColumnLayout {
                     Layout.fillWidth: true
+                    Layout.minimumWidth: 360
                     Layout.alignment: Qt.AlignTop
                     spacing: root.sp
                     Card {
@@ -300,7 +309,7 @@ Item {
                                 ColumnLayout {
                                     id: srow
                                     anchors.fill: parent; anchors.margins: 6
-                                    T2 { text: (modelData.programName || root.short(modelData.programId)) + "  (" + modelData.size + " bytes)"; color: root.cText }
+                                    T2 { text: (modelData.programName || root.shortId(modelData.programId)) + "  (" + modelData.size + " bytes)"; color: root.cText }
                                     Mono {
                                         text: modelData.balance !== undefined ? "balance " + root.units(modelData.balance)
                                               : modelData.text !== undefined ? "“" + modelData.text + "”" : "0x" + modelData.hex
@@ -329,16 +338,28 @@ Item {
                             Field { id: callMsg; placeholderText: callEnc.currentText === "hex" ? "borsh-encoded message, hex" : "Hola mundo!" }
                         }
                         T3 { Layout.fillWidth: true; text: callEnc.currentText === "text" ? "text = a borsh Vec<u8> of the text (what hello_world takes); hex = the exact message bytes; raw-text = the text's bytes as they are" : callEnc.currentText === "hex" ? "the exact borsh-encoded message the program expects" : "the text's UTF-8 bytes, unframed" }
-                        CheckBox { id: callSign; text: "the account signs too (programs that check is_authorized need it)" }
+                        RowLayout {
+                            id: signRow
+                            Layout.fillWidth: true
+                            readonly property bool isPayer: callAcct.text.trim() !== "" && callAcct.text.trim() === String(root.st.payer || "")
+                            // the host style draws CheckBox text too dim on the dark theme: label it ourselves
+                            CheckBox { id: callSign; visible: !parent.isPayer }
+                            T2 {
+                                Layout.fillWidth: true
+                                text: parent.isPayer ? "the account signs: it pays the fee, and LEZ has the payer sign"
+                                                     : "the account signs too (programs that check is_authorized need it)"
+                                MouseArea { anchors.fill: parent; enabled: callSign.visible; onClicked: callSign.checked = !callSign.checked }
+                            }
+                        }
                         RowLayout {
                             LogosButton {
                                 objectName: "sendCall"
                                 text: "Send"
                                 enabled: callProg.text.trim() !== "" && callAcct.text.trim() !== "" && !!root.st.payer
-                                onClicked: root.act("callProgram", [JSON.stringify({ programId: callProg.text.trim(), accountId: callAcct.text.trim(), message: callMsg.text, encoding: callEnc.currentText, sign: callSign.checked })],
+                                onClicked: root.act("callProgram", [JSON.stringify({ programId: callProg.text.trim(), accountId: callAcct.text.trim(), message: callMsg.text, encoding: callEnc.currentText, sign: callSign.checked || signRow.isPayer })],
                                                     "Sent - waiting for the chain")
                             }
-                            T3 { text: root.st.payer ? "fee paid by " + root.short(root.st.payer) : "choose a payer in Accounts" }
+                            T3 { text: root.st.payer ? "fee paid by " + root.shortId(root.st.payer) : "choose a payer in Accounts" }
                         }
                     }
                     Card {
@@ -365,7 +386,7 @@ Item {
                                 enabled: tFrom.text.trim() !== "" && tTo.text.trim() !== "" && tAmount.text !== ""
                                 onClicked: root.act("transfer", [JSON.stringify({ from: tFrom.text.trim(), to: tTo.text.trim(), amount: tAmount.text })], "Sent - the credit can take a block or two")
                             }
-                            T3 { text: "fee paid by " + root.short(root.st.payer || tFrom.text) }
+                            T3 { text: "fee paid by " + root.shortId(root.st.payer || tFrom.text) }
                         }
                     }
                     Card {
@@ -381,7 +402,7 @@ Item {
                                 RowLayout {
                                     Layout.fillWidth: true
                                     T2 {
-                                        text: (modelData.kind === "call" ? "call " + root.short(modelData.request.programId) : "transfer " + root.units(modelData.request.amount) + " → " + root.short(modelData.request.to))
+                                        text: (modelData.kind === "call" ? "call " + root.shortId(modelData.request.programId) : "transfer " + root.units(modelData.request.amount) + " → " + root.shortId(modelData.request.to))
                                         color: root.cText; Layout.fillWidth: true
                                     }
                                     T2 {

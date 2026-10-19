@@ -84,6 +84,11 @@ if [ -n "${HELLO_PROGRAM:-}" ]; then
   echo "  job: $J" | cut -c1-400
   [ "$STATE" = applied ] && [ "$(echo "$J" | field result.stateAfterText)" = "Hola mundo!" ]; check $? "hello_world wrote \"Hola mundo!\" to its actor state"
   G=$(call getAccount str:$NEW); echo "$G" | grep -q '"programName": "hello_world"'; check $? "the account shows a hello_world actor state, labelled"
+  # the payer's own account, sign off: LEZ refuses a non-signing payer, so the payer's mention must sign
+  C=$(call callProgram "str:{\"programId\":\"$HELLO_PROGRAM\",\"accountId\":\"$ACC_B\",\"message\":\"payer here\",\"encoding\":\"text\",\"sign\":false}"); JOB=$(echo "$C" | field jobId)
+  for i in $(seq 1 60); do J=$(call job str:$JOB); STATE=$(echo "$J" | field state); case "$STATE" in applied|reverted|failed|unknown) break;; esac; sleep 2; done
+  echo "  job: $J" | cut -c1-300
+  [ "$STATE" = applied ] && [ "$(echo "$J" | field result.signedAsPayer)" = True ]; check $? "a call on the payer's own account is applied (the payer signs)"
 fi
 
 if [ -n "${AUTH_PROGRAM:-}" ]; then

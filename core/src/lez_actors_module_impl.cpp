@@ -282,7 +282,27 @@ std::string LezActorsModuleImpl::importKey(std::string privateKeyHex) {
         wallet_ffi_save(m_wallet);
         return json::object();
     }, kQuickOpTimeoutMs);
-    listAccounts();
+    // a new wallet's first account is empty and is the payer by default: when the payer can't
+    // pay and an imported account can, the funded one pays from now on
+    json acc = json::parse(listAccounts(), nullptr, false);
+    json out = json::parse(r, nullptr, false);
+    if (acc.is_object() && out.is_object() && out.value("status", "") == "ok") {
+        std::string payerB58; { std::lock_guard<std::recursive_mutex> lk(m_mtx); payerB58 = m_payer; }
+        std::string best, payerBal = "0";
+        lez::u128 bestBal = 0;
+        for (const auto& a : acc.value("accounts", json::array())) {
+            std::string id = a.value("accountId", ""), bal = a.value("balance", "0");
+            if (id == payerB58) payerBal = bal;
+            auto v = lez::parseU128(bal);
+            if (a.value("onChain", false) && v && *v > bestBal) { bestBal = *v; best = id; }
+        }
+        auto pv = lez::parseU128(payerBal);
+        if (!best.empty() && best != payerB58 && (!pv || *pv == 0)) {
+            { std::lock_guard<std::recursive_mutex> lk(m_mtx); m_payer = best; saveSettings(); }
+            out["payerChanged"] = best;
+            r = out.dump();
+        }
+    }
     publish();
     return r;
 }
@@ -490,10 +510,13 @@ static std::string sendPublic(WalletHandle* w, std::vector<std::pair<lez::Id, st
     std::vector<FfiAccountMention> mentions;
     for (const auto& [account, progSign] : actors) {
         FfiAccountMention m{};
-        FfiOperationError e = wallet_ffi_resolve_public_account(ffiId(account), progSign.second, &m.identity);
+        // LEZ refuses a payer that is a non-signing account of the transaction: the payer signs
+        // anyway, so a mention of the payer always authorizes
+        bool sign = progSign.second || account == payer;
+        FfiOperationError e = wallet_ffi_resolve_public_account(ffiId(account), sign, &m.identity);
         if (e != FfiOperationError_Success) { *err = "can't resolve account " + lez::b58(account) + ": " + ffiErr(e); for (auto& x : mentions) wallet_ffi_free_account_identity(&x.identity); return ""; }
         m.program_account_id = ffiId(progSign.first);
-        m.authorizes = progSign.second;
+        m.authorizes = sign;
         m.address_openings = nullptr; m.address_openings_size = 0;
         mentions.push_back(m);
     }
@@ -501,7 +524,7 @@ static std::string sendPublic(WalletHandle* w, std::vector<std::pair<lez::Id, st
     FfiTransactionResult res{};
     FfiOperationError e = wallet_ffi_send_generic_public_transaction(w, mentions.data(), mentions.size(), 0, message.data(), message.size(), &p, &res);
     for (auto& x : mentions) wallet_ffi_free_account_identity(&x.identity);
-    if (e != FfiOperationError_Success || !res.tx_hash) { *err = "the sequencer refused the transaction (" + ffiErr(e) + "); the payer may not cover the fee reserve"; wallet_ffi_free_transaction_result(&res); return ""; }
+    if (e != FfiOperationError_Success || !res.tx_hash) { *err = "the wallet couldn't build or send the transaction (" + ffiErr(e) + "); the reason is in the host log, after [ffi]"; wallet_ffi_free_transaction_result(&res); return ""; }
     std::string hash = res.tx_hash;
     wallet_ffi_free_transaction_result(&res);
     auto hb = lez::unhex(hash);
@@ -556,6 +579,7 @@ void LezActorsModuleImpl::runCall(Job& j) {
     }
     bool changed = stateAfter != stateBefore;
     json res = {{"included", true}, {"stateBefore", lez::hex(stateBefore)}, {"stateAfter", lez::hex(stateAfter)}, {"reverted", !changed}};
+    if (!sign && acct == payer) res["signedAsPayer"] = true;
     if (auto t = lez::printable(stateBefore)) res["stateBeforeText"] = *t;
     if (auto t = lez::printable(stateAfter)) res["stateAfterText"] = *t;
     if (!changed) res["revertReason"] = "reverted, reason unavailable (it is in the sequencer's log); the fee was still charged";
