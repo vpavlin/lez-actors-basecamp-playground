@@ -603,21 +603,36 @@ Item {
                         T3 { Layout.fillWidth: true; text: "★ pays fees   ▶ shown below   balances in raw units" }
                         Repeater {
                             model: root.accounts
+                            // two lines: the account and its balance, then its actions (one line
+                            // didn't fit the 520 px column: the id and balance overlapped)
                             delegate: Rectangle {
                                 required property var modelData
                                 Layout.fillWidth: true
-                                implicitHeight: arow.implicitHeight + 8
+                                implicitHeight: acol.implicitHeight + 10
                                 radius: root.rad
                                 color: modelData.accountId === root.st.selected ? root.cInset : "transparent"
-                                RowLayout {
-                                    id: arow
-                                    anchors.fill: parent; anchors.margins: 4
-                                    T2 { text: (modelData.accountId === root.st.payer ? "★ " : "  ") + (modelData.accountId === root.st.selected ? "▶ " : "  ") + root.shortId(modelData.accountId); font.family: "monospace" }
-                                    T2 { Layout.fillWidth: true; horizontalAlignment: Text.AlignRight; text: modelData.onChain ? root.units(modelData.balance) : "off-chain"; color: modelData.onChain ? root.cText : root.cText3 }
-                                    LogosButton { text: "Show"; onClicked: root.act("setSelected", [modelData.accountId], "") }
-                                    LogosButton { text: "Copy"; onClicked: root.copyText(modelData.accountId) }
-                                    LogosButton { text: "Send to"; enabled: modelData.accountId !== tFrom.text.trim(); onClicked: { tTo.text = modelData.accountId; root.toast("Recipient set in Native transfer", false) } }
-                                    LogosButton { text: "Pay with"; enabled: modelData.accountId !== root.st.payer; onClicked: root.act("setPayer", [modelData.accountId], "Payer set") }
+                                ColumnLayout {
+                                    id: acol
+                                    anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top; anchors.margins: 5
+                                    spacing: 4
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        T2 {
+                                            text: (modelData.accountId === root.st.payer ? "★ " : "  ") + (modelData.accountId === root.st.selected ? "▶ " : "  ") + root.shortId(modelData.accountId)
+                                                  + (root.accountLabel(modelData.accountId) !== root.shortId(modelData.accountId) ? "  (" + root.accountLabel(modelData.accountId) + ")" : "")
+                                            font.family: "monospace"; color: root.cText
+                                            Layout.fillWidth: true; elide: Text.ElideRight; wrapMode: Text.NoWrap
+                                        }
+                                        T2 { text: modelData.onChain ? root.units(modelData.balance) : "off-chain"; color: modelData.onChain ? root.cText : root.cText3; wrapMode: Text.NoWrap }
+                                    }
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        LogosButton { text: "Show"; onClicked: root.act("setSelected", [modelData.accountId], "") }
+                                        LogosButton { text: "Copy"; onClicked: root.copyText(modelData.accountId) }
+                                        LogosButton { text: "Send to"; enabled: modelData.accountId !== tFrom.text.trim(); onClicked: { tTo.text = modelData.accountId; root.toast("Recipient set in Native transfer", false) } }
+                                        LogosButton { text: "Pay with"; enabled: modelData.accountId !== root.st.payer; onClicked: root.act("setPayer", [modelData.accountId], "Payer set") }
+                                        Item { Layout.fillWidth: true }
+                                    }
                                 }
                             }
                         }
