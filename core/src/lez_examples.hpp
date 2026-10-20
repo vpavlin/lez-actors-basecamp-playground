@@ -174,6 +174,105 @@ inline StepFlow flowFor(const std::string& ex, const std::string& step) {
     return {};
 }
 
+// The code that handles a step's message n (1-based): the receiving program's source file
+// (examples/src/<file>.rs, embedded), the lines to highlight (each starts at the first line containing
+// `anchor` and runs `lines` lines), and what that run receives and returns.
+struct CodeRef {
+    std::string file;
+    std::vector<std::pair<std::string, int>> ranges;
+    std::string says;
+    std::string panicAnchor = "";   // the line that panics, when this message's run fails
+};
+std::pair<const char*, size_t> exampleSource(const char* name);   // examples/src/*.rs, embedded
+
+inline CodeRef codeFor(const std::string& ex, const std::string& step, int n) {
+    const std::string acv = "actor_conversation", nt = "native_token";
+    if (ex == "actor_conversation") {
+        if (step == "ping" || step == "ping-undeclared") {
+            if (n == 1) return {acv, {{"match borsh::from_slice::<Message>", 1}, {"Message::Ping { to, note } =>", 11}},
+                "actor_conversation runs on (account 1). from: the transaction. message: Ping { to: account 2 }. It records the ping in its "
+                "state and returns send_async(Pong to (account 2, actor_conversation)). That message doesn't run now: async messages wait "
+                "until the synchronous work is done. This run is over."};
+            if (step == "ping-undeclared") return {acv, {{"Message::Pong { note } =>", 11}},
+                "Never runs. Account 2 isn't declared in the transaction, so the engine can't deliver Pong here, and a public account has "
+                "no mailbox for later. The engine refuses (UnboundAsyncDestination) and the whole transaction reverts, run 1 included."};
+            return {acv, {{"Message::Pong { note } =>", 11}},
+                "actor_conversation runs on (account 2): a separate run, on another account's actor. from: (account 1, actor_conversation). "
+                "message: Pong. from_own_program() is true, so it accepts it and records it. It's still the same transaction, after the "
+                "sync work, and is_authorized is false: async messages carry no authorization."};
+        }
+        bool fail = step == "require-fail";
+        if (n == 1) return {acv, {{"match borsh::from_slice::<Message>", 3}, {"fn ask(", 12}},
+            std::string("Run 1 of actor_conversation, on (account 1). from: the transaction. message: ") +
+            (step == "ask" ? "AskBalance { of: payer }" : "Require { of: payer, min }") +
+            ". handle_message decodes it and calls ask(), which returns two things: set_state(its lines + a pending note "
+            "\"#pending min=...\") and send_sync(ReadState to (payer, native token)). Then this run is OVER. It doesn't wait for "
+            "an answer, and nothing of it stays in memory except the state it saved."};
+        if (n == 2) return {nt, {{"pub fn handle_message", 6}, {"Message::ReadState =>", 6}},
+            "The native token runs on (payer, native token). from: (account 1, actor_conversation). message: ReadState. It keeps its "
+            "own state (the balance) and sends a StateReply carrying that state back to whoever asked: send_sync(reader, "
+            "StateReply::from(input)). That's the whole \"return value\": a new message, back to the sender."};
+        return {acv, {{"if input.from.is_some_and", 4}, {"fn on_reply(", 15}},
+            std::string("Run 2 of actor_conversation, again on (account 1). This is a NEW run of handle_message, from the top, not a "
+            "continuation of run 1. from: (payer, native token), so it takes the reply branch. pre_state: what run 1 wrote, including the "
+            "pending note, which is how run 2 knows what run 1 asked. on_reply reads the balance from the StateReply and checks it against "
+            "the minimum. ") +
+            (fail ? "The check FAILS: assert! panics here, and the engine undoes everything: run 1's pending note, the ReadState round "
+                    "trip, all of it."
+                  : "It passes, so it replaces the note with the balance it read."),
+            fail ? "balance >= min," : ""};
+    }
+    if (ex == "hello_world") return {"hello_world", {{"fn handle_message", 5}},
+        "hello_world runs on (account 1). message: the text. pre_state: its bytes so far. It returns set_state(pre_state + text). One "
+        "run, no messages sent."};
+    if (ex == "hello_world_with_authorization") return {"hello_world_with_authorization", {{"fn handle_message", 11}},
+        step == "unsigned"
+            ? "It runs on (account 1) with is_authorized = false, because account 1 didn't sign the transaction. assert!(input.is_authorized) "
+              "panics: the transaction reverts."
+            : "It runs on (account 1) with is_authorized = true, because account 1 signed. The assert passes and it appends the text.",
+        step == "unsigned" ? "assert!(input.is_authorized" : ""};
+    if (ex == "hello_world_with_move_function") {
+        const std::string mv = "hello_world_with_move_function";
+        if (step == "write") return {mv, {{"Message::Write(data) =>", 1}, {"fn append(", 3}}, "On (account 1): Write(data) appends the bytes to its slot."};
+        if (step == "append-direct") return {mv, {{"Message::Append(data) =>", 7}},
+            "On (account 2). from: the transaction, so from_own_program() is false. assert! panics: only this program may send Append.",
+            "assert!("};
+        if (n == 1) return {mv, {{"Message::MoveData { data, to } =>", 11}},
+            step == "move-wrong"
+                ? "On (account 1): assert_eq! compares its state with the `data` the message claims. They differ, so it panics: nothing "
+                  "is sent and nothing moves."
+                : "On (account 1): it checks it holds exactly `data`, clears its own slot (set_state(empty)) and returns "
+                  "send_sync(Append(data) to (account 2, the same program)). This run is over.",
+            step == "move-wrong" ? "assert_eq!(" : ""};
+        return {mv, {{"Message::Append(data) =>", 7}, {"fn append(", 3}},
+            "On (account 2): a new run of the same program, on another account. from: (account 1, this program), so from_own_program() "
+            "is true and it appends the moved bytes."};
+    }
+    if (ex == "simple_tail_call") {
+        if (n == 1) return {"simple_tail_call", {{"fn handle_message", 4}},
+            "simple_tail_call runs on (account 1). message: the callee actor (account 1, hello_world). It keeps its own state and returns "
+            "send_sync(a greeting to the callee). This run is over."};
+        return {"hello_world", {{"fn handle_message", 5}},
+            "hello_world runs on (account 1). from: (account 1, simple_tail_call). message: the greeting. Same account, another program's "
+            "slot: it appends the greeting to hello_world's state."};
+    }
+    return {};
+}
+
+// Resolves a CodeRef's anchors in `source` to 1-based [first, last] line ranges; an anchor that
+// isn't found yields nothing (the unit test checks every one is).
+inline std::vector<std::pair<int, int>> resolveRanges(const std::string& source, const CodeRef& c) {
+    std::vector<std::string> lines;
+    std::string cur;
+    for (char ch : source) { if (ch == '\n') { lines.push_back(cur); cur.clear(); } else cur += ch; }
+    if (!cur.empty()) lines.push_back(cur);
+    std::vector<std::pair<int, int>> out;
+    for (const auto& [anchor, count] : c.ranges)
+        for (size_t i = 0; i < lines.size(); i++)
+            if (lines[i].find(anchor) != std::string::npos) { out.push_back({int(i) + 1, int(std::min(lines.size(), i + size_t(count)))}); break; }
+    return out;
+}
+
 // borsh messages of the example programs
 inline void appendVec(Bytes& out, const Bytes& v) {
     uint32_t n = uint32_t(v.size());

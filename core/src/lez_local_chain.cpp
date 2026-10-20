@@ -433,6 +433,14 @@ void LezActorsModuleImpl::runExample(Job& j) {
         j.result["revertReason"] = "the engine refused it (UnboundAsyncDestination): an async message to a public actor must be declared in the transaction; the fee was charged";
 }
 
+std::string LezActorsModuleImpl::programSource(std::string name) {
+    name = unquote(name);
+    auto src = lez::exampleSource(name.c_str());
+    if (!src.first) return fail("no source for " + name);
+    return ok({{"name", name}, {"source", std::string(src.first, src.second)},
+               {"origin", name == "actor_conversation" ? "this playground (core/examples/src)" : name == "native_token" ? "LEZ, lee/state_machine/core/src/native_token.rs" : "LEZ, examples/program_deployment/methods/guest/src/bin"}});
+}
+
 // The step's messages, resolved to real actors, each with what became of it, for the actor map.
 void LezActorsModuleImpl::attachFlow(Job& j, const std::string& ex, const std::string& step, const lez::Id& a, const lez::Id& b, const lez::Id& prog) {
     lez::StepFlow f = lez::flowFor(ex, step);
@@ -459,7 +467,21 @@ void LezActorsModuleImpl::attachFlow(Job& j, const std::string& ex, const std::s
             : n < f.failsAt ? "undone"
             : n == f.failsAt ? (f.refused ? "refused" : "panicked")
             : "never ran";
-        msgs.push_back({{"n", n}, {"from", actorOf(m.from)}, {"to", actorOf(m.to)}, {"kind", m.kind}, {"name", m.name}, {"status", status}});
+        json msg = {{"n", n}, {"from", actorOf(m.from)}, {"to", actorOf(m.to)}, {"kind", m.kind}, {"name", m.name}, {"status", status}};
+        // the code that handles it, for the code view next to the map
+        lez::CodeRef c = lez::codeFor(ex, step, n);
+        if (!c.file.empty()) {
+            auto src = lez::exampleSource(c.file.c_str());
+            json ranges = json::array();
+            if (src.first) for (const auto& [first, last] : lez::resolveRanges(std::string(src.first, src.second), c)) ranges.push_back({first, last});
+            msg["code"] = {{"file", c.file}, {"ranges", ranges}, {"says", c.says}};
+            if (!c.panicAnchor.empty() && src.first) {
+                lez::CodeRef p{c.file, {{c.panicAnchor, 1}}, ""};
+                auto pr = lez::resolveRanges(std::string(src.first, src.second), p);
+                if (!pr.empty()) msg["code"]["panicLine"] = pr[0].first;
+            }
+        }
+        msgs.push_back(msg);
     }
     j.result["flow"] = msgs;
 }

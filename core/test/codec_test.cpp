@@ -2,7 +2,13 @@
 // g++ -std=c++20 -I../src -I<nlohmann include> codec_test.cpp -o codec_test && ./codec_test
 #include "lez_codec.hpp"
 #include "lez_examples.hpp"
+#include <fstream>
+#include <iterator>
 #include <cstdio>
+namespace lez {
+std::pair<const uint8_t*, size_t> exampleElf(const char*) { return {nullptr, 0}; }
+std::pair<const char*, size_t> exampleSource(const char*) { return {nullptr, 0}; }
+}
 static int fails = 0, passes = 0;
 #define CHECK(c, m) do { if (c) passes++; else { fails++; std::printf("FAIL: %s\n", m); } } while (0)
 using namespace lez;
@@ -64,6 +70,20 @@ int main() {
     }
     CHECK(flowFor("actor_conversation", "ask").messages.size() == 3 && flowFor("actor_conversation", "ask").messages[2].to == "A/prog", "ask: request, ReadState, and the reply back to the asker");
     CHECK(flowFor("actor_conversation", "ping-undeclared").refused, "the undeclared ping is an engine refusal");
+    // every message's code anchors exist in its source file
+    for (const auto& e : examples()) for (const auto& st : e.steps) {
+        StepFlow f = flowFor(e.name, st.id);
+        for (size_t n = 1; n <= f.messages.size(); n++) {
+            CodeRef c = codeFor(e.name, st.id, int(n));
+            std::ifstream in(std::string(EXAMPLES_SRC) + "/" + c.file + ".rs");
+            std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            auto r = resolveRanges(text, c);
+            CHECK(!c.file.empty() && !text.empty() && r.size() == c.ranges.size() && !c.says.empty(),
+                  (e.name + "/" + st.id + " message " + std::to_string(n) + ": code anchors found").c_str());
+            if (!c.panicAnchor.empty()) CHECK(resolveRanges(text, CodeRef{c.file, {{c.panicAnchor, 1}}, ""}).size() == 1, (e.name + "/" + st.id + ": panic line found").c_str());
+            if (int(n) == f.failsAt && !f.refused) CHECK(!c.panicAnchor.empty(), (e.name + "/" + st.id + ": the panicking message names its panic line").c_str());
+        }
+    }
     std::printf("%d passed, %d failed\n", passes, fails);
     return fails ? 1 : 0;
 }

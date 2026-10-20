@@ -41,6 +41,14 @@ Item {
     property int chainLogSeq: 0
     property bool showLog: false
     property var stepText: ({})      // "example/step" -> edited text
+    property var sources: ({})       // program source name -> {source, origin}
+    function loadSource(name) {
+        if (!name || root.sources[name]) return
+        root.core("programSource", [name], function (raw) {
+            var r = root.parse(raw)
+            if (r && r.status === "ok") { var c = root.sources; c[name] = { source: r.source, origin: r.origin }; root.sources = c }
+        })
+    }
     readonly property var chain: root.st.localChain || ({})
     readonly property bool walletOpen: !!(root.st.wallet && root.st.wallet.open)
 
@@ -249,6 +257,8 @@ Item {
         property var flow: []
         property var actors: []
         property string jobState: ""
+        property int focusHop: 0          // 0: every message alike; n: message n stands out
+        onFocusHopChanged: canvas.requestPaint()
         readonly property var cols: {
             var out = [], seen = {}
             for (var i = 0; i < flow.length; i++) for (var k of ["to", "from"]) {
@@ -329,8 +339,14 @@ Item {
                 readonly property var r: amap.cellAt(index % amap.cols.length, Math.floor(index / amap.cols.length))
                 x: r.x; y: r.y; width: r.w; height: r.h; radius: root.rad + 2
                 color: touched ? root.cInset : "transparent"
-                border.color: !touched ? root.cLine : changed ? root.cOk : root.cText3
-                border.width: changed ? 2 : 1
+                // the actor the focused message is delivered to
+                readonly property bool receiving: {
+                    if (amap.focusHop < 1 || amap.focusHop > amap.flow.length) return false
+                    var t = amap.flow[amap.focusHop - 1].to
+                    return !!t && t.accountId === account.id && t.programId === program.id
+                }
+                border.color: receiving ? root.cPrimary : !touched ? root.cLine : changed ? root.cOk : root.cText3
+                border.width: receiving ? 3 : changed ? 2 : 1
                 opacity: touched ? 1 : 0.3
                 ColumnLayout {
                     anchors.fill: parent; anchors.margins: 6
@@ -376,9 +392,10 @@ Item {
                     p = { x: p.x + nx * off, y: p.y + ny * off }; q = { x: q.x + nx * off, y: q.y + ny * off }
                     var s0 = clip(p, q, fr), e0 = clip(q, p, tr)
                     var bad = m.status === "panicked" || m.status === "refused"
+                    ctx.globalAlpha = amap.focusHop > 0 && amap.focusHop !== m.n ? 0.22 : 1
                     var col = bad ? String(root.cErr) : (m.status === "undone" || m.status === "never ran") ? String(root.cText3)
                             : m.kind === "async" ? String(root.cWarn) : m.kind === "root" ? String(root.cText2) : String(root.cPrimary)
-                    ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = 2
+                    ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = amap.focusHop === m.n ? 3.5 : 2
                     if (ctx.setLineDash) ctx.setLineDash(m.kind === "async" || m.status === "never ran" ? [7, 5] : [])
                     ctx.beginPath(); ctx.moveTo(s0.x, s0.y); ctx.lineTo(e0.x, e0.y); ctx.stroke()
                     if (ctx.setLineDash) ctx.setLineDash([])
@@ -405,6 +422,51 @@ Item {
                     var ly = my + (Math.abs(nx) < 0.3 ? (ny > 0 ? 16 : -16) : 0)
                     ctx.fillStyle = String(root.cBg); ctx.fillRect(lx - 3, ly - 8, lw + 6, 16)
                     ctx.fillStyle = col; ctx.fillText(label, lx, ly)
+                }
+                ctx.globalAlpha = 1
+            }
+        }
+    }
+    // A program's source: the highlighted ranges as excerpts, in the order they run (a dispatch, then
+    // the function it calls), with a line of context around each; or the whole file.
+    component CodeView: Rectangle {
+        id: cv
+        property string source: ""
+        property var ranges: []          // [[first, last], ...], 1-based, in reading order
+        property int panicLine: 0        // the line that panicked, if this run failed
+        property bool whole: false
+        readonly property var lines: source.split("\n")
+        function hot(n) { for (var i = 0; i < ranges.length; i++) if (n >= ranges[i][0] && n <= ranges[i][1]) return true; return false }
+        // [{n, text, hot}], n = 0 for a gap marker
+        readonly property var rows: {
+            var out = []
+            if (whole || !ranges.length) { for (var i = 0; i < lines.length; i++) out.push({ n: i + 1, text: lines[i], hot: hot(i + 1) }); return out }
+            for (var r = 0; r < ranges.length; r++) {
+                var first = Math.max(1, ranges[r][0] - 1), last = Math.min(lines.length, ranges[r][1] + 1)
+                if (r > 0) out.push({ n: 0, text: "⋮", hot: false })
+                for (var k = first; k <= last; k++) out.push({ n: k, text: lines[k - 1], hot: hot(k) })
+            }
+            return out
+        }
+        color: root.cInset; radius: root.rad; border.color: root.cLine
+        implicitHeight: whole ? 380 : Math.min(380, rows.length * 17 + 16)
+        onRangesChanged: scrollTimer.restart()
+        onWholeChanged: scrollTimer.restart()
+        Timer { id: scrollTimer; interval: 50; onTriggered: if (cv.whole && cv.ranges.length) list.positionViewAtIndex(Math.max(0, cv.ranges[0][0] - 4), ListView.Beginning); else list.positionViewAtBeginning() }
+        ListView {
+            id: list
+            anchors.fill: parent; anchors.margins: 6
+            clip: true
+            model: cv.rows
+            ScrollBar.vertical: ScrollBar {}
+            delegate: Rectangle {
+                required property var modelData
+                width: list.width; height: 17
+                color: modelData.n > 0 && modelData.n === cv.panicLine ? "#5a1d1a" : modelData.hot ? "#2d4a1e" : "transparent"
+                Row {
+                    spacing: 8
+                    Text { width: 30; horizontalAlignment: Text.AlignRight; text: modelData.n ? String(modelData.n) : ""; color: root.cText3; font.family: "monospace"; font.pixelSize: 11 }
+                    Text { text: modelData.text + (modelData.n > 0 && modelData.n === cv.panicLine ? "      ← panics here" : ""); color: modelData.n === 0 ? root.cText3 : modelData.hot ? root.cText : root.cText2; font.family: "monospace"; font.pixelSize: 11; textFormat: Text.PlainText }
                 }
             }
         }
@@ -624,6 +686,12 @@ Item {
                                 readonly property var job: root.lastStepJob(exCard.modelData.name, modelData.id)
                                 readonly property bool running: !!job && ["applied", "failed", "reverted", "unknown"].indexOf(job.state) < 0
                                 property bool showDetails: false
+                                // the message flow and the step-through position (0: all messages)
+                                readonly property var flow: job && job.result && job.result.flow ? job.result.flow : []
+                                property int hop: 0
+                                readonly property var hopCode: hop > 0 && hop <= flow.length ? flow[hop - 1].code || null : null
+                                onHopCodeChanged: if (hopCode) root.loadSource(hopCode.file)
+                                onJobChanged: if (!job) hop = 0
                                 Layout.fillWidth: true
                                 implicitHeight: stepCol.implicitHeight + 16
                                 color: root.cInset; radius: root.rad; border.color: root.cLine
@@ -688,13 +756,67 @@ Item {
                                         }
                                     }
                                     // the actors and the messages between them
-                                    ActorMap {
-                                        visible: !!(stepBox.job && stepBox.job.result && stepBox.job.result.flow)
+                                    // the buttons first, so they stay put while the text changes
+                                    RowLayout {
+                                        visible: !!stepBox.flow.length
                                         Layout.fillWidth: true
-                                        Layout.preferredHeight: implicitHeight
-                                        flow: stepBox.job && stepBox.job.result && stepBox.job.result.flow ? stepBox.job.result.flow : []
-                                        actors: stepBox.job && stepBox.job.result && stepBox.job.result.actors ? stepBox.job.result.actors : []
-                                        jobState: stepBox.job ? stepBox.job.state : ""
+                                        LogosButton { text: "◀"; enabled: stepBox.hop > 1; onClicked: stepBox.hop-- }
+                                        LogosButton { text: stepBox.hop === 0 ? "Step through ▶" : "▶"; enabled: stepBox.hop < stepBox.flow.length; onClicked: stepBox.hop++ }
+                                        LogosButton { text: "Show all"; enabled: stepBox.hop > 0; onClicked: stepBox.hop = 0 }
+                                        T2 {
+                                            Layout.fillWidth: true
+                                            text: stepBox.hop === 0 ? "All " + stepBox.flow.length + " messages. Step through them to see the code that handles each one."
+                                                  : "Message " + stepBox.hop + " of " + stepBox.flow.length + ": " + stepBox.flow[stepBox.hop - 1].name
+                                            color: root.cText
+                                        }
+                                    }
+                                    T2 {
+                                        visible: stepBox.hop > 0 && !!stepBox.hopCode
+                                        Layout.fillWidth: true
+                                        color: root.cText
+                                        text: stepBox.hopCode ? stepBox.hopCode.says : ""
+                                    }
+                                    GridLayout {
+                                        id: mapCode
+                                        visible: !!stepBox.flow.length
+                                        Layout.fillWidth: true
+                                        // side by side when there's room for both
+                                        readonly property bool wide: width >= 1250
+                                        columns: stepBox.hop > 0 && wide ? 2 : 1
+                                        columnSpacing: root.sp; rowSpacing: root.spS
+                                        ActorMap {
+                                            Layout.fillWidth: true
+                                            Layout.preferredWidth: 1
+                                            Layout.preferredHeight: implicitHeight
+                                            Layout.alignment: Qt.AlignTop
+                                            flow: stepBox.flow
+                                            actors: stepBox.job && stepBox.job.result && stepBox.job.result.actors ? stepBox.job.result.actors : []
+                                            jobState: stepBox.job ? stepBox.job.state : ""
+                                            focusHop: stepBox.hop
+                                        }
+                                        ColumnLayout {
+                                            visible: stepBox.hop > 0 && !!stepBox.hopCode
+                                            Layout.fillWidth: true
+                                            Layout.preferredWidth: 1
+                                            Layout.alignment: Qt.AlignTop
+                                            spacing: 2
+                                            RowLayout {
+                                                Layout.fillWidth: true
+                                                T3 {
+                                                    Layout.fillWidth: true
+                                                    text: stepBox.hopCode ? "the code that handles it: " + stepBox.hopCode.file + ".rs  -  " + (root.sources[stepBox.hopCode.file] ? root.sources[stepBox.hopCode.file].origin : "loading...") : ""
+                                                }
+                                                LogosButton { text: codeView.whole ? "Just the lines that run" : "Whole file"; onClicked: codeView.whole = !codeView.whole }
+                                            }
+                                            CodeView {
+                                                id: codeView
+                                                Layout.fillWidth: true
+                                                Layout.preferredHeight: implicitHeight
+                                                source: stepBox.hopCode && root.sources[stepBox.hopCode.file] ? root.sources[stepBox.hopCode.file].source : ""
+                                                ranges: stepBox.hopCode ? stepBox.hopCode.ranges : []
+                                                panicLine: stepBox.hopCode && stepBox.hopCode.panicLine && stepBox.flow[stepBox.hop - 1].status === "panicked" ? stepBox.hopCode.panicLine : 0
+                                            }
+                                        }
                                     }
                                     T3 {
                                         visible: !!(stepBox.job && stepBox.job.result && stepBox.job.result.flow)

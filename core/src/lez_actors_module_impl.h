@@ -76,6 +76,7 @@ public:
     std::string listExamples();
     std::string deployExample(std::string name);
     std::string runExampleStep(std::string requestJson);
+    std::string programSource(std::string name);
 
 protected:
     void onContextReady() override;
