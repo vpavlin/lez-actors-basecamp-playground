@@ -28,6 +28,36 @@ jobs:
             extra-substituters = https://cache.nix.logos.co/public
             extra-trusted-public-keys = public:Z1wyVBEx8PHbXujYB52Mysv9Rd8rWIhyQ3bQyef9yy4=
             accept-flake-config = true
+            trusted-users = root runner
+      # The LEZ library (core_ffi, ~150 MB, most of the build time) depends only on the LEZ pin, our
+      # patch and the root flake, not on the app. Keep its Nix output in the Actions cache and offer
+      # it to Nix as a local binary cache, so a build with the same pin fetches it instead of
+      # compiling LEZ again.
+      - name: Restore the LEZ library
+        id: lez-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/lez-nix-cache
+          key: core-ffi-${{ runner.arch }}-${{ hashFiles('flake.nix', 'flake.lock', 'patches/**') }}
+      - name: Build the LEZ library (or fetch it from the cache)
+        shell: bash
+        run: |
+          set -eu -o pipefail
+          mkdir -p logs
+          subst=()
+          [ -d /tmp/lez-nix-cache ] && subst=(--option extra-substituters "file:///tmp/lez-nix-cache?trusted=1")
+          start=$(date +%s)
+          nix build --accept-flake-config "${subst[@]}" .#core_ffi -o res-core-ffi 2>&1 | tail -5 | tee logs/core_ffi.log
+          echo "core_ffi ready in $(( $(date +%s) - start )) s (cache ${{ steps.lez-cache.outputs.cache-hit == 'true' && 'hit' || 'miss' }})" | tee -a logs/core_ffi.log
+      - name: Save the LEZ library
+        if: steps.lez-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: nix copy --to "file:///tmp/lez-nix-cache?compression=zstd" "$(readlink -f res-core-ffi)"
+      - uses: actions/cache/save@v4
+        if: steps.lez-cache.outputs.cache-hit != 'true'
+        with:
+          path: /tmp/lez-nix-cache
+          key: ${{ steps.lez-cache.outputs.cache-primary-key }}
       - name: Build
         shell: bash
         run: |
@@ -36,7 +66,9 @@ jobs:
           ok=1
           for m in lez_actors_module:core lez_actors_ui:ui; do
             name=${m%%:*}; dir=${m#*:}
-            if (cd "$dir" && nix build --accept-flake-config .#lgx-portable -o "$GITHUB_WORKSPACE/res-$name") > "logs/$name.log" 2>&1; then
+            subst=()
+            [ -d /tmp/lez-nix-cache ] && subst=(--option extra-substituters "file:///tmp/lez-nix-cache?trusted=1")
+            if (cd "$dir" && nix build --accept-flake-config "${subst[@]}" .#lgx-portable -o "$GITHUB_WORKSPACE/res-$name") > "logs/$name.log" 2>&1; then
               cp -L res-$name/*.lgx "out/$name-linux-arm64.lgx"; echo "$name OK"
             else
               echo "$name FAILED"; tail -80 "logs/$name.log"; ok=0
