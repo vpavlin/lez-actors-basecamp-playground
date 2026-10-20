@@ -144,7 +144,7 @@ inline std::optional<std::string> printable(const Bytes& b) {
         uint8_t c = b[i]; int len = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : (c >> 3) == 30 ? 4 : 0;
         if (!len || i + len > b.size()) return std::nullopt;
         for (int k = 1; k < len; k++) if ((b[i + k] & 0xC0) != 0x80) return std::nullopt;
-        if (len == 1 && (c < 0x20 || c == 0x7f)) return std::nullopt;
+        if (len == 1 && ((c < 0x20 && c != '\n' && c != '\t') || c == 0x7f)) return std::nullopt;
         i += len;
     }
     return std::string(b.begin(), b.end());

@@ -22,7 +22,7 @@ using namespace lezmod;
 namespace {
 
 constexpr uint8_t kNativeTransferVariant = 0;      // native_token::Message::Transfer
-constexpr long long kCreditWaitMs = 60000;          // async credits land a block or two later
+constexpr long long kCreditWaitMs = 60000;          // the credit lands in the same tx; this covers the RPC lagging
 
 }  // namespace
 
@@ -589,7 +589,12 @@ void LezActorsModuleImpl::runCall(Job& j) {
     bool changed = false;
     for (int i = 0; i < 6 && !changed; i++) {
         if (i) std::this_thread::sleep_for(std::chrono::seconds(1));
-        for (size_t k = 0; k < actors.size(); k++) { after[k] = stateOf(actors[k].first, actors[k].second.first); if (after[k] != before[k]) changed = true; }
+        for (size_t k = 0; k < actors.size(); k++) {
+            after[k] = stateOf(actors[k].first, actors[k].second.first);
+            // the payer's balance moves by the fee either way: not the call's effect
+            bool payerBalance = actors[k].first == payer && actors[k].second.first == lez::nativeTokenId();
+            if (after[k] != before[k] && !payerBalance) changed = true;
+        }
     }
     lez::Bytes payerAfter = stateOf(payer, lez::nativeTokenId());
     lez::u128 pb = lez::decodeU128le(payerBefore), pa = lez::decodeU128le(payerAfter);
@@ -598,8 +603,15 @@ void LezActorsModuleImpl::runCall(Job& j) {
         json s = {{"accountId", lez::b58(actors[k].first)}, {"programId", lez::b58(actors[k].second.first)}, {"signs", actors[k].second.second || actors[k].first == payer},
                   {"before", lez::hex(before[k])}, {"after", lez::hex(after[k])}, {"changed", after[k] != before[k]}};
         if (auto n = programName(lez::b58(actors[k].second.first)); !n.empty()) s["programName"] = n;
-        if (auto t = lez::printable(before[k])) s["beforeText"] = *t;
-        if (auto t = lez::printable(after[k])) s["afterText"] = *t;
+        if (actors[k].second.first == lez::nativeTokenId()) {
+            // a balance: 16 bytes LE; show it as a number
+            s["beforeText"] = "balance " + lez::u128str(lez::decodeU128le(before[k]));
+            s["afterText"] = "balance " + lez::u128str(lez::decodeU128le(after[k]));
+            if (actors[k].first == payer) s["note"] = "the payer: its balance moves by the fee";
+        } else {
+            if (auto t = lez::printable(before[k])) s["beforeText"] = *t;
+            if (auto t = lez::printable(after[k])) s["afterText"] = *t;
+        }
         states.push_back(s);
     }
     json res = {{"included", true}, {"reverted", !changed}, {"actors", states}, {"messageHex", lez::hex(message)}, {"payer", lez::b58(payer)},
@@ -620,7 +632,7 @@ std::string LezActorsModuleImpl::revertReason(long long seq) {
     std::string p = m_tap.panicSince(seq);
     if (!p.empty()) return p + "; included and the fee was charged";
     bool local; { std::lock_guard<std::recursive_mutex> lk(m_mtx); local = m_chain != nullptr; }
-    return local ? "reverted; no guest panic in the local chain's log; the fee was charged"
+    return local ? "refused by the engine, not the program (no guest panic in the chain's log); the fee was charged"
                  : "reverted, reason unavailable (it is in the sequencer's log); the fee was still charged";
 }
 
@@ -675,7 +687,8 @@ void LezActorsModuleImpl::runTransfer(Job& j) {
     if (hash.empty()) { j.state = "failed"; j.error = err; return; }
     j.txHash = hash;
     if (!included) { j.state = "failed"; j.error = "not included within the wallet's poll window"; return; }
-    // the credit is an async message: give it up to a minute to land
+    // the credit is an async message to the (declared) recipient: the engine runs it in this same
+    // transaction; the poll only covers the RPC catching up
     lez::u128 senderAfter = senderBefore, recipientAfter = recipientBefore, payerAfter = payerBefore;
     long long deadline = nowMs() + kCreditWaitMs;
     for (;;) {

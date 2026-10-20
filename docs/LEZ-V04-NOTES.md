@@ -47,8 +47,39 @@ links LEZ's own C library, `lez/core_ffi`, built from the pinned LEZ commit (ADR
   × base_fee_stor. On the dev chain both base fees are 8, which gives 16,004,800 raw units. An
   account needs amount + reserve to send. The fee actually charged is far lower (4–6 k raw units
   per simple tx) *(verified)*.
-- **Credits are async.** A transfer's credit can land a block after inclusion. Judge a transfer by
-  polling balances (we poll for up to 60 s), not by inclusion alone.
+- **A transfer's credit is an async message, but it lands in the same transaction**, because the
+  recipient is declared (§2b). An RPC read right after inclusion can still lag a moment, so judge a
+  transfer by the balances (polled briefly), not by inclusion alone.
+
+## 2b. How actors talk to each other
+
+*(Verified with `actor_conversation`; engine code in `lee/state_machine/core/src/execution_state.rs`.)*
+
+A handler returns a `Response`: its new state plus the messages it sends. It can't call and wait.
+
+- **Synchronous** (`send_sync`, `SyncMessage`): runs right away, depth-first, inside the sender's
+  part of the transaction. **There is no return value.** To get data back, the receiver sends a
+  reply message to `input.from`, and the sender's program runs a second time to handle it.
+  - The pattern is the native token's `ReadState`, which answers with `send_sync(reader,
+    &StateReply::from(input))`. The fee program uses it.
+  - The second run sees the state the first run wrote, so a request can leave a pending note for
+    its reply.
+- **Asynchronous** (`send_async`, `AsyncMessage`) **to a public actor runs in the same
+  transaction**, after the current synchronous work, and carries **no authorization**. The engine
+  "promotes" it only when its destination is **declared** in the public context (mentioned).
+  Otherwise the message goes to the global mailbox. That needs a recovery binding, which only
+  **private** accounts have, so a public destination fails the whole transaction with
+  `UnboundAsyncDestination`. "Later, in another transaction" applies only to private recipients and
+  cross-zone messages.
+- **All or nothing:** a panic in any hop undoes every hop of the transaction, including state that
+  earlier hops wrote. The transaction is still included and charged, at the whole gas limit.
+- **Events** (`Response::event`) are stored by the sequencer **only for final blocks**. A
+  standalone dev chain (mock Bedrock) never finalizes its blocks, so only genesis events are ever
+  queryable there (`sequencer_ffi_query_events` returns nothing for later blocks). To trace a
+  conversation on a dev chain, have each hop write into its own actor state.
+- Engine-level refusals (`UnboundAsyncDestination`, `UnadmittedPublicActor`, ...) aren't guest
+  panics. core_ffi's sequencer logger only enables the `sequencer_core` / `sequencer_ffi` targets,
+  so they don't reach the log of an embedded chain.
 
 ## 3. Sequencer JSON-RPC (what we use)
 

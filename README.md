@@ -39,6 +39,7 @@ What we learned about v0.4 while building it (the model, fees, the C API, buildi
    | `hello_world_with_authorization` | unsigned (reverts, still charged), then signed (applies) |
    | `hello_world_with_move_function` | write, move bytes to a second account, move bytes the source doesn't hold (reverts), Append from outside (reverts) |
    | `simple_tail_call` | one program calling another (`hello_world`) on the same account |
+   | `actor_conversation` (ours, `core/examples/src`) | actors talking: a sync request/reply (ask the native token for a balance and get a `StateReply` back), the same with a check that rolls the whole transaction back, and an async ping to a declared actor (runs in the same transaction) and to an undeclared one (refused). The result draws each hop, read back from the actors' states |
 
    Steps run on two example accounts of their own, which never pay fees, so whether they sign is up
    to the step. `tail_call_with_pda` isn't included: core_ffi's C API can't send PDA admission
@@ -57,7 +58,7 @@ RISC0_DEV_MODE=1 sequencer_service start <home>     # http://127.0.0.1:3040; nee
 
 In Explorer: connect, create or unlock a wallet, import a funded key, choose the payer, and add
 programs by header id. A call that leaves the state unchanged **reverted**: it was still included and
-charged. Transfers are judged from both balances, since the credit can land a block or two later.
+charged. Transfers are judged from both balances.
 
 ## Build
 

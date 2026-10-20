@@ -148,6 +148,32 @@ Item {
         if (id === ex[1]) return "example account 2"
         return root.shortId(id)
     }
+    // copy to the clipboard through a hidden text edit (QML has no clipboard API of its own)
+    function copyText(t) { clip.text = String(t || ""); clip.selectAll(); clip.copy(); clip.text = ""; root.toast("Copied " + root.shortId(t), false) }
+    function programInfo(pid) {
+        for (var i = 0; i < root.programs.length; i++) if (root.programs[i].programId === pid) return root.programs[i]
+        return null
+    }
+    function programKind(pid) {
+        var p = root.programInfo(pid)
+        if (!p) return "a program not in your list (add it in Programs to name it)"
+        if (p.name === "native token") return "built into the engine"
+        if (p.name === "program_loader") return "built into the engine"
+        return p.builtin ? "a built-in program (LEZ's own guests)" : "a program you deployed or added"
+    }
+    // what this program keeps in its actor state, as far as this app knows
+    function stateMeaning(name) {
+        var m = {
+            "native token": "This account's native-token balance: a 16-byte little-endian number. A transfer rewrites it on the sender and on the recipient.",
+            "program_loader": "Program bytecode or a program header: this account is part of a deployed program, not a user account.",
+            "hello_world": "The bytes hello_world appended here, one call after another. Only hello_world can write this slot.",
+            "hello_world_with_authorization": "The bytes appended by calls this account authorized (signed). An unsigned call reverts and leaves it as it was.",
+            "hello_world_with_move_function": "Bytes written here, or moved here from another account's slot under the same program. A move empties the source's slot.",
+            "simple_tail_call": "simple_tail_call keeps its own state unchanged: its effect shows up in the callee's slot (hello_world's) instead.",
+            "actor_conversation": "The last few things actor_conversation did on this account: balances it read back from the native token (sync request/reply), pings it sent, and pings it received (async)."
+        }
+        return m[name] || "Bytes that program chose to keep for this account. Only that program can change them, by being called on this actor."
+    }
     function stateColor(state) { return state === "applied" ? root.cOk : (["reverted", "failed", "unknown"].indexOf(state) >= 0 ? root.cErr : root.cWarn) }
     function bytesText(hex, text) { return !hex ? "(empty)" : text !== undefined ? "“" + text + "”" : "0x" + hex }
     function payerFunded() {
@@ -179,6 +205,42 @@ Item {
         color: root.cCard; radius: root.rad + 4; border.color: root.cLine
         ColumnLayout { id: inner; anchors.fill: parent; anchors.margins: root.sp; spacing: root.spS }
     }
+    // the v0.4 model in a few lines: what an account, an actor and an actor state are
+    component ActorExplainer: Rectangle {
+        id: explainer
+        property bool open: false
+        Layout.fillWidth: true
+        implicitHeight: exCol.implicitHeight + 16
+        color: root.cInset; radius: root.rad; border.color: root.cLine
+        ColumnLayout {
+            id: exCol
+            anchors.fill: parent; anchors.margins: 8
+            spacing: 4
+            RowLayout {
+                Layout.fillWidth: true
+                T2 { text: "What is an actor?"; color: root.cText; font.weight: Font.DemiBold; Layout.fillWidth: true }
+                LogosButton { text: explainer.open ? "Hide" : "Explain"; onClicked: explainer.open = !explainer.open }
+            }
+            T3 {
+                Layout.fillWidth: true
+                text: "In LEZ v0.4 an account doesn't hold one blob of data. It holds one slot per program, and an actor is that pair: (account, program)."
+            }
+            T2 {
+                visible: explainer.open
+                Layout.fillWidth: true
+                text: "• Account: an address (32 bytes, shown in base58) with a nonce. By itself it holds nothing else.\n"
+                    + "• Actor: (account, program). Every program that has written to an account owns one slot on it: the actor state. Only that program can change its slot, and many programs can keep slots on the same account side by side.\n"
+                    + "• Your balance is no exception: it's the native-token program's actor state on your account, a 16-byte number.\n"
+                    + "• Calling a program means sending a message to an actor. The program runs with that actor's current bytes (pre_state) and returns the new bytes, plus any messages it wants to send on to other actors.\n"
+                    + "• A synchronous message runs right away, inside the sender's handling (depth-first). There is no return value: to get data back, the receiver sends a reply message, and the sender's program runs again to handle it.\n"
+                    + "• An asynchronous message to a public actor runs after the synchronous work, still in the same transaction, and carries no authorization. Its destination must be declared in the transaction, or the engine refuses it. (Only private accounts and other zones get async messages later, through a mailbox.) A native transfer is one: Transfer debits the sender and sends Credit to the recipient asynchronously.\n"
+                    + "• One transaction is all or nothing: if any step panics, every step is undone.\n"
+                    + "• Every actor a call touches is mentioned in the transaction, and each mention says whether its account signs. A program sees that as is_authorized, and can refuse to act without it.\n"
+                    + "• Fees: a payer account declares and pays the fee and always signs. A call that reverts (the program panics) is still included and charged, with the whole declared gas limit, and leaves every actor state unchanged.\n"
+                    + "• Compared with v0.2/v0.3, where a program owned an account outright: now no program owns the account, each owns only its slot."
+            }
+        }
+    }
     component Field: TextField {
         Layout.fillWidth: true; Layout.minimumWidth: 80
         color: root.cText; placeholderTextColor: root.cText3; font.pixelSize: 13
@@ -186,6 +248,7 @@ Item {
     }
 
     Rectangle { anchors.fill: parent; color: root.cBg }
+    TextEdit { id: clip; visible: false }
 
     ScrollView {
         anchors.fill: parent
@@ -208,7 +271,8 @@ Item {
                 RowLayout {
                     Layout.fillWidth: true
                     T2 { text: "Sequencer" }
-                    Field { id: rpcField; objectName: "rpcField"; placeholderText: "http://127.0.0.1:3040"; Component.onCompleted: text = root.st.rpcUrl || "http://127.0.0.1:3040" }
+                    // follows the module's address until you type in it (the first snapshot arrives after load)
+                    Field { id: rpcField; objectName: "rpcField"; placeholderText: "http://127.0.0.1:3040"; text: root.st.rpcUrl || "" }
                     LogosButton { text: "Connect"; onClicked: root.act("setEndpoint", [rpcField.text.trim()], "Sequencer set") }
                 }
                 T2 {
@@ -274,8 +338,8 @@ Item {
                         Layout.fillWidth: true
                         T1 { text: "1. A local v0.4 chain"; Layout.fillWidth: true }
                         T2 {
-                            text: root.chain.state === "running" ? "running in this app, on 127.0.0.1:3040"
-                                  : root.chain.state === "external" ? "using the sequencer already on 127.0.0.1:3040"
+                            text: root.chain.state === "running" ? "running in this app, on " + (root.st.rpcUrl || "")
+                                  : root.chain.state === "external" ? "using the sequencer already on " + (root.st.rpcUrl || "") + " (another app's: stop that one to run this app's own)"
                                   : root.chain.state || "stopped"
                             color: root.chain.state === "running" || root.chain.state === "external" ? root.cOk : root.chain.state === "failed" ? root.cErr : root.cWarn
                         }
@@ -349,6 +413,7 @@ Item {
 
                 // 4. the examples
                 T1 { text: "4. The examples: LEZ's program-deployment tutorial programs"; Layout.topMargin: root.spS }
+                ActorExplainer { open: true }
                 T2 {
                     Layout.fillWidth: true
                     text: "Each is a real RISC Zero guest from LEZ (examples/program_deployment), built into this app. Deploy uploads it through the program loader: the bytecode goes into segment accounts and a header account points at them; "
@@ -442,12 +507,67 @@ Item {
                                             Layout.fillWidth: true
                                             color: modelData.changed ? root.cText : root.cText3
                                             text: (index === 0 ? "root actor  " : "mentioned   ") + "(" + root.accountLabel(modelData.accountId) + ", " + (modelData.programName || root.shortId(modelData.programId)) + ")"
-                                                  + (modelData.signs ? "  signs" : "") + "\n    " + root.bytesText(modelData.before, modelData.beforeText) + "  →  " + root.bytesText(modelData.after, modelData.afterText)
+                                                  + (modelData.signs ? "  signs" : "") + (modelData.note ? "  - " + modelData.note : "")
+                                                  + "\n    before: " + root.bytesText(modelData.before, modelData.beforeText).replace(/\n/g, "\n            ")
+                                                  + "\n    after:  " + root.bytesText(modelData.after, modelData.afterText).replace(/\n/g, "\n            ")
                                             font.family: "monospace"
                                         }
                                     }
+                                    // the conversation, hop by hop, as the program recorded it
+                                    T2 {
+                                        visible: !!(stepBox.job && stepBox.job.result && stepBox.job.result.hops && stepBox.job.result.hops.length)
+                                        text: "The conversation, read back from the chain (each hop wrote one line into its own actor's state; -> sent, <- received):"
+                                        color: root.cText
+                                    }
+                                    Repeater {
+                                        model: stepBox.job && stepBox.job.result && stepBox.job.result.hops ? stepBox.job.result.hops : []
+                                        delegate: RowLayout {
+                                            required property var modelData
+                                            required property int index
+                                            readonly property bool sameTx: !!modelData.sameTx
+                                            Layout.fillWidth: true
+                                            Rectangle {
+                                                Layout.preferredWidth: 22; Layout.preferredHeight: 22; radius: 11
+                                                Layout.alignment: Qt.AlignTop
+                                                color: parent.sameTx ? root.cPrimary : root.cWarn
+                                                Text { anchors.centerIn: parent; text: String(index + 1); color: "#10130f"; font.pixelSize: 12; font.weight: Font.DemiBold }
+                                            }
+                                            ColumnLayout {
+                                                Layout.fillWidth: true
+                                                spacing: 0
+                                                T3 { Layout.fillWidth: true; color: root.cText; text: modelData.text; font.family: "monospace" }
+                                                T3 {
+                                                    Layout.fillWidth: true
+                                                    text: "on (" + root.accountLabel(modelData.accountId) + ", actor_conversation)  -  "
+                                                          + (parent.parent.sameTx ? "this transaction" + (modelData.block ? ", block " + modelData.block : "")
+                                                                                  : "a LATER transaction" + (modelData.block ? ", seen by block " + modelData.block : ""))
+                                                    color: parent.parent.sameTx ? root.cText3 : root.cWarn
+                                                }
+                                            }
+                                        }
+                                    }
+                                    T3 {
+                                        visible: !!(stepBox.job && stepBox.job.result && stepBox.job.result.hops && stepBox.job.result.hops.length === 0 && stepBox.job.state !== "reverted")
+                                        Layout.fillWidth: true
+                                        text: "No new lines on the actors this step mentions."
+                                    }
+                                    T3 {
+                                        visible: !!(stepBox.job && stepBox.job.state === "reverted" && stepBox.job.request.example === "actor_conversation")
+                                        Layout.fillWidth: true
+                                        text: stepBox.job && stepBox.job.request.step === "ping-undeclared"
+                                              ? "No hops left on chain: the engine refused the whole transaction, so even account 1's \"-> sent Pong\" line was undone."
+                                              : "No hops left on chain: every hop was undone, including the request the first hop recorded before the third one panicked."
+                                    }
                                     T3 { visible: !!(stepBox.job && stepBox.job.result && stepBox.job.result.messageHex); Layout.fillWidth: true; text: stepBox.job && stepBox.job.result ? "message (borsh) 0x" + stepBox.job.result.messageHex : ""; font.family: "monospace"; wrapMode: Text.WrapAnywhere }
                                     T3 { visible: !!(stepBox.job && stepBox.job.txHash); Layout.fillWidth: true; text: stepBox.job ? "tx " + stepBox.job.txHash : ""; font.family: "monospace" }
+                                    RowLayout {
+                                        visible: !!(stepBox.job && stepBox.job.result && stepBox.job.result.actors)
+                                        LogosButton {
+                                            text: "See the account in Explorer"
+                                            onClicked: { root.act("setSelected", [stepBox.job.result.actors[stepBox.job.result.actors.length - 1].accountId], ""); tabs.currentIndex = 1 }
+                                        }
+                                        T3 { text: "every actor state on it, with what each means" }
+                                    }
                                 }
                             }
                         }
@@ -495,6 +615,8 @@ Item {
                                     T2 { text: (modelData.accountId === root.st.payer ? "★ " : "  ") + (modelData.accountId === root.st.selected ? "▶ " : "  ") + root.shortId(modelData.accountId); font.family: "monospace" }
                                     T2 { Layout.fillWidth: true; horizontalAlignment: Text.AlignRight; text: modelData.onChain ? root.units(modelData.balance) : "off-chain"; color: modelData.onChain ? root.cText : root.cText3 }
                                     LogosButton { text: "Show"; onClicked: root.act("setSelected", [modelData.accountId], "") }
+                                    LogosButton { text: "Copy"; onClicked: root.copyText(modelData.accountId) }
+                                    LogosButton { text: "Send to"; enabled: modelData.accountId !== tFrom.text.trim(); onClicked: { tTo.text = modelData.accountId; root.toast("Recipient set in Native transfer", false) } }
                                     LogosButton { text: "Pay with"; enabled: modelData.accountId !== root.st.payer; onClicked: root.act("setPayer", [modelData.accountId], "Payer set") }
                                 }
                             }
@@ -548,12 +670,20 @@ Item {
                         objectName: "accountDetail"
                         T1 { text: "Account" }
                         T2 { visible: !root.detail; text: "Choose \"Show\" on an account." }
-                        Mono { visible: !!root.detail; text: root.detail ? root.detail.accountId : "" }
+                        RowLayout {
+                            visible: !!root.detail
+                            Layout.fillWidth: true
+                            Mono { text: root.detail ? root.detail.accountId : "" }
+                            LogosButton { text: "Copy"; onClicked: root.copyText(root.detail.accountId) }
+                            LogosButton { text: "Send to"; onClicked: { tTo.text = root.detail.accountId; root.toast("Recipient set in Native transfer", false) } }
+                        }
+                        ActorExplainer {}
                         T2 {
                             visible: !!root.detail
                             text: root.detail ? (root.detail.onChain ? "nonce " + root.detail.nonce + "  -  balance " + root.units(root.detail.balance) + " raw units" : "not on chain yet: nothing has written to this account") : ""
                         }
-                        T3 { visible: !!root.detail && root.detail.actorStates.length > 0; text: "Actor states - one per program that keeps state on this account:" }
+                        T3 { visible: !!root.detail && root.detail.actorStates.length > 0; Layout.fillWidth: true; text: "Actor states on this account: one slot per program that keeps state here. Each is the actor (this account, that program)." }
+                        T3 { visible: !!root.detail && root.detail.onChain === false; Layout.fillWidth: true; text: "No actor states yet: no program has written to this account. It appears on chain when one does (a transfer to it, or a call on it)." }
                         Repeater {
                             model: root.detail ? root.detail.actorStates : []
                             delegate: Rectangle {
@@ -564,10 +694,20 @@ Item {
                                 ColumnLayout {
                                     id: srow
                                     anchors.fill: parent; anchors.margins: 6
-                                    T2 { text: (modelData.programName || root.shortId(modelData.programId)) + "  (" + modelData.size + " bytes)"; color: root.cText }
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        T2 { text: "actor (this account, " + (modelData.programName || root.shortId(modelData.programId)) + ")"; color: root.cText; Layout.fillWidth: true }
+                                        T3 { text: modelData.size + " bytes" }
+                                    }
                                     Mono {
-                                        text: modelData.balance !== undefined ? "balance " + root.units(modelData.balance)
+                                        text: modelData.balance !== undefined ? "balance " + root.units(modelData.balance) + " raw units"
                                               : modelData.text !== undefined ? "“" + modelData.text + "”" : "0x" + modelData.hex
+                                    }
+                                    T3 { Layout.fillWidth: true; text: root.stateMeaning(modelData.programName || "") }
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        T3 { text: "program " + modelData.programId + "  -  " + root.programKind(modelData.programId); font.family: "monospace"; Layout.fillWidth: true; wrapMode: Text.WrapAnywhere }
+                                        LogosButton { text: "Copy id"; onClicked: root.copyText(modelData.programId) }
                                     }
                                 }
                             }
@@ -639,7 +779,7 @@ Item {
                             LogosButton {
                                 text: "Send"
                                 enabled: tFrom.text.trim() !== "" && tTo.text.trim() !== "" && tAmount.text !== ""
-                                onClicked: root.act("transfer", [JSON.stringify({ from: tFrom.text.trim(), to: tTo.text.trim(), amount: tAmount.text })], "Sent - the credit can take a block or two")
+                                onClicked: root.act("transfer", [JSON.stringify({ from: tFrom.text.trim(), to: tTo.text.trim(), amount: tAmount.text })], "Sent - waiting for the chain")
                             }
                             T3 { text: "fee paid by " + root.shortId(root.st.payer || tFrom.text) }
                         }

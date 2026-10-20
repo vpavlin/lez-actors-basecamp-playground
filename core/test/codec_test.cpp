@@ -47,7 +47,14 @@ int main() {
     Id acct{}; acct[0] = 0xaa; Id prg{}; prg[0] = 0xbb;
     Bytes act = actorBytes(acct, prg);
     CHECK(act.size() == 64 && act[0] == 0xaa && act[32] == 0xbb, "Actor: account id then program id, 64 bytes");
-    CHECK(examples().size() == 4 && findExample("simple_tail_call") && findExample("simple_tail_call")->needs.size() == 1, "example catalog");
+    CHECK(examples().size() == 5 && findExample("simple_tail_call") && findExample("simple_tail_call")->needs.size() == 1, "example catalog");
+    Bytes ask = acvAskBalance(dst);
+    CHECK(ask.size() == 33 && ask[0] == 0 && ask[1] == 7, "actor_conversation AskBalance{of}: variant 0 + 32-byte id");
+    Bytes req = acvRequire(dst, u128(1000));
+    CHECK(req.size() == 1 + 32 + 16 && req[0] == 1 && req[33] == 0xe8 && req[34] == 0x03, "actor_conversation Require{of, min}: variant 1 + id + LE u128");
+    Bytes png = acvPing(dst, ab);
+    CHECK(png.size() == 1 + 32 + 4 + 2 && png[0] == 2 && png[33] == 2, "actor_conversation Ping{to, note}: variant 2 + id + vec");
+    CHECK(findStep(*findExample("actor_conversation"), "ping-undeclared")->expect == "reverted", "an undeclared async destination is refused");
     for (const auto& e : examples()) for (const auto& st : e.steps) CHECK(st.expect == "applied" || st.expect == "reverted", "every step states its expected outcome");
     std::printf("%d passed, %d failed\n", passes, fails);
     return fails ? 1 : 0;

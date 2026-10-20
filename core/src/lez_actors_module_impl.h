@@ -107,6 +107,8 @@ private:
     void runTransfer(Job& j);
     void runDeploy(Job& j);
     void runExample(Job& j);
+    std::vector<std::string> newLines(const lez::Bytes& before, const lez::Bytes& after);
+    uint64_t blockOfTx(const std::string& txHashHex);
     std::string sendPublic(std::vector<std::pair<lez::Id, std::pair<lez::Id, bool>>> actors, const lez::Bytes& message,
                            const lez::Id& payer, bool* included, std::string* err);
     std::string revertReason(long long logSeqBefore);

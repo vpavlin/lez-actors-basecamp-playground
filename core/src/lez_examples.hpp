@@ -79,6 +79,44 @@ inline const std::vector<Example>& examples() {
            "(account 1, hello_world); both actors are mentioned. The change shows up in "
            "hello_world's state, not in simple_tail_call's.",
            false, ""}}},
+        {"actor_conversation", "actor_conversation: actors talking to each other (sync, async, rollback)",
+         "Written for this playground (core/examples/src/actor_conversation.rs). A program that "
+         "talks to other actors and records each hop as a line in its own actor state, so the result "
+         "shows the conversation, read back from the chain: who sent what to whom. A synchronous message runs right away, inside the "
+         "sender's handling, but has no return value, so data comes back as a reply message that runs "
+         "the sender again. An asynchronous message to a public actor runs after that, still in the "
+         "same transaction, and carries no authorization. A panic in any hop undoes all of them.",
+         {},
+         {{"ask", "Ask the native token for the payer's balance (sync)", "applied",
+           "AskBalance: actor_conversation on account 1 notes a pending request and sends ReadState "
+           "to the native token's actor on the payer. The native token answers with a StateReply "
+           "sent back to (account 1, actor_conversation), in this same transaction, and "
+           "actor_conversation runs a second time to record the balance. Three hops, one transaction.",
+           false, ""},
+          {"require-ok", "Require the payer to hold at least 1000 (sync, passes)", "applied",
+           "The same round trip, but the reply handler checks the balance it got back against a "
+           "minimum. The payer has far more, so it records the balance.",
+           false, ""},
+          {"require-fail", "Require far more than the payer holds (sync, rolls back)", "reverted",
+           "The reply handler panics because the balance is below the minimum. The panic is in the "
+           "third hop, but the whole transaction is undone: the pending note the first hop wrote "
+           "never lands, and account 1's state is exactly as before. Still included and charged.",
+           false, ""},
+          {"ping", "Ping example account 2, which the transaction declares (async)", "applied",
+           "Ping: actor_conversation on account 1 sends Pong to actor_conversation on account 2 as an "
+           "ASYNCHRONOUS message, and the transaction mentions account 2. A declared public destination "
+           "runs in this transaction, so the engine promotes the message: Pong runs in this same "
+           "transaction, after the synchronous work, and carries no authorization (is_authorized is "
+           "false for it). Both lines land in one transaction. Only private accounts and other zones "
+           "get async messages later.",
+           true, "hello from account 1"},
+          {"ping-undeclared", "Ping account 2 without declaring it (async, refused)", "reverted",
+           "The same Ping, but the transaction doesn't mention account 2. For a public destination the "
+           "engine can't promote it into this transaction, and the global mailbox (where async messages "
+           "wait for a later transaction) only takes messages for private accounts. So the engine refuses "
+           "the whole transaction (UnboundAsyncDestination): every async message to a public actor must be "
+           "declared. An engine error, not a program panic; still included and charged.",
+           true, "undeclared"}}},
     };
     return all;
 }
@@ -102,6 +140,14 @@ inline void appendVec(Bytes& out, const Bytes& v) {
 inline Bytes moveFnWrite(const Bytes& data) { Bytes b{0}; appendVec(b, data); return b; }
 inline Bytes moveFnMoveData(const Bytes& data, const Id& to) { Bytes b{1}; appendVec(b, data); b.insert(b.end(), to.begin(), to.end()); return b; }
 inline Bytes moveFnAppend(const Bytes& data) { Bytes b{2}; appendVec(b, data); return b; }
+// actor_conversation::Message: 0 AskBalance{of}, 1 Require{of, min: u128}, 2 Ping{to, note}, 3 Pong{note}
+inline Bytes acvAskBalance(const Id& of) { Bytes b{0}; b.insert(b.end(), of.begin(), of.end()); return b; }
+inline Bytes acvRequire(const Id& of, u128 min) {
+    Bytes b{1}; b.insert(b.end(), of.begin(), of.end());
+    for (int i = 0; i < 16; i++) b.push_back(uint8_t(min >> (8 * i)));
+    return b;
+}
+inline Bytes acvPing(const Id& to, const Bytes& note) { Bytes b{2}; b.insert(b.end(), to.begin(), to.end()); appendVec(b, note); return b; }
 // an Actor is {account_id: [u8; 32], program_account_id: [u8; 32]}
 inline Bytes actorBytes(const Id& account, const Id& program) {
     Bytes b(account.begin(), account.end());

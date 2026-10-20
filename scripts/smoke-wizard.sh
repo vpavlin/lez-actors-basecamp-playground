@@ -3,15 +3,17 @@
 # in-process v0.4 chain, imports the dev accounts, deploys every example and runs every step,
 # checking each step's outcome against what it says it does.
 #   scripts/smoke-wizard.sh <lez_actors_module.lgx>
-# Needs logosctl 0.3.x (LOGOSCTL) and a FREE 127.0.0.1:3040 (otherwise the module uses whatever
-# answers there instead of its own chain, and this test says so).
+# Needs logosctl 0.3.x (LOGOSCTL) and a free 127.0.0.1:$CHAIN_PORT (default 3041; if something
+# answers there, the module uses it instead of its own chain, and this test says so).
 set -u
 LGX=${1:?the lez_actors_module .lgx}
 L=${LOGOSCTL:-logosctl}
 BASE=${SMOKE_DIR:-/tmp/lez-actors-smoke-wizard}
 pass=0; fail=0
 check() { if [ "$1" = 0 ]; then pass=$((pass+1)); echo "  ok   $2"; else fail=$((fail+1)); echo "  FAIL $2"; fi; }
-ctl() { HOME="$BASE/home" LOGOSCTL_CONFIG_DIR="$BASE/cfg" QT_QPA_PLATFORM=offscreen timeout 90 "$L" "$@"; }
+# its own port, so it never touches another local sequencer on LEZ's usual 3040 (prog-tui's)
+PORT=${CHAIN_PORT:-3041}
+ctl() { HOME="$BASE/home" LOGOSCTL_CONFIG_DIR="$BASE/cfg" QT_QPA_PLATFORM=offscreen LEZ_ACTORS_CHAIN_PORT=$PORT LEZ_RPC_URL=http://127.0.0.1:$PORT timeout 90 "$L" "$@"; }
 res() { python3 -c 'import json,sys
 raw=sys.stdin.read().strip().splitlines(); d=json.loads(raw[-1]) if raw else {}
 r=d.get("result",d)
@@ -30,7 +32,7 @@ waitjob() { local J S; for i in $(seq 1 90); do J=$(call job str:$1); S=$(echo "
 [ -d "$BASE/cfg" ] && ctl daemon stop >/dev/null 2>&1
 rm -rf "$BASE"; mkdir -p "$BASE/home"
 ctl daemon start --detach >/dev/null
-HOME="$BASE/home" LOGOSCTL_CONFIG_DIR="$BASE/cfg" QT_QPA_PLATFORM=offscreen timeout 600 "$L" install "$LGX" -y >/dev/null || echo "install failed"
+HOME="$BASE/home" LOGOSCTL_CONFIG_DIR="$BASE/cfg" QT_QPA_PLATFORM=offscreen LEZ_ACTORS_CHAIN_PORT=$PORT timeout 600 "$L" install "$LGX" -y >/dev/null || echo "install failed"
 ctl module load lez_actors_module >/dev/null
 sleep 2
 
@@ -38,7 +40,7 @@ echo "== the local chain"
 S=$(call startLocalChain); echo "  $S" | cut -c1-200
 for i in $(seq 1 60); do ST=$(call localChainStatus | field state); case "$ST" in running|failed|external) break;; esac; sleep 1; done
 [ "$ST" = running ]; check $? "the in-process chain is running (state: $ST $(call localChainStatus | field error))"
-H=$(call health); [ "$(echo "$H" | field reachable)" = True ]; check $? "it answers JSON-RPC on 127.0.0.1:3040 (block $(echo "$H" | field blockHeight))"
+H=$(call health); [ "$(echo "$H" | field reachable)" = True ]; check $? "it answers JSON-RPC on 127.0.0.1:$PORT (block $(echo "$H" | field blockHeight))"
 
 echo "== wallet + dev accounts"
 W=$(call createWallet str:wizard-pass); [ "$(echo "$W" | field status)" = ok ]; check $? "createWallet"
@@ -50,13 +52,13 @@ check $? "the 20 T dev account is on chain and funded"
 [ "$(echo "$A" | field payer)" = 2RHZhw9h534Zr3eq2RGhQete2Hh667foECzXPmSkGni2 ]; check $? "it is the payer"
 
 echo "== the examples"
-for ex in hello_world hello_world_with_authorization hello_world_with_move_function simple_tail_call; do
+for ex in hello_world hello_world_with_authorization hello_world_with_move_function simple_tail_call actor_conversation; do
   J=$(call deployExample str:$ex); JOB=$(echo "$J" | field jobId)
   J=$(waitjob "$JOB"); echo "  deploy $ex: $(echo "$J" | field state) $(echo "$J" | field error | cut -c1-200)"
   [ "$(echo "$J" | field state)" = applied ]; check $? "deploy $ex"
 done
 E=$(call listExamples)
-echo "$E" | python3 -c 'import json,sys; e=json.load(sys.stdin)["examples"]; sys.exit(0 if all(x["deployed"] for x in e) else 1)'; check $? "listExamples shows all four deployed"
+echo "$E" | python3 -c 'import json,sys; e=json.load(sys.stdin)["examples"]; sys.exit(0 if all(x["deployed"] for x in e) else 1)'; check $? "listExamples shows all five deployed"
 
 steps() { echo "$E" | python3 -c 'import json,sys; [print(x["name"], s["id"], s["expect"]) for x in json.load(sys.stdin)["examples"] for s in x["steps"]]'; }
 while read -r ex step expect; do
@@ -66,6 +68,14 @@ while read -r ex step expect; do
   ST=$(echo "$J" | field state); AE=$(echo "$J" | field result.asExpected); WHY=$(echo "$J" | field result.revertReason)
   echo "  $ex/$step -> $ST ${WHY:+($WHY)} $(echo "$J" | field error | cut -c1-160)"
   [ "$ST" = "$expect" ] && [ "$AE" = True ]; check $? "$ex/$step is $expect, as it says"
+  if [ "$ex/$step" = actor_conversation/ask ]; then
+    echo "$J" | python3 -c 'import json,sys; h=json.load(sys.stdin)["result"].get("hops",[]); print("   hops:", *[x["text"][:100] for x in h], sep="\n     "); sys.exit(0 if len(h)==2 and all(x["sameTx"] for x in h) and h[0]["text"].startswith("->") and h[1]["text"].startswith("<-") else 1)'
+    check $? "ask: two hops (request ->, reply <-) on the one actor, in the one transaction"
+  fi
+  if [ "$ex/$step" = actor_conversation/ping ]; then
+    echo "$J" | python3 -c 'import json,sys; r=json.load(sys.stdin)["result"]; h=r.get("hops",[]); print("   ping hops:", *[("same tx  " if x["sameTx"] else "LATER    ")+x["text"][:80] for x in h], sep="\n     "); sys.exit(0 if len(h)==2 and all(x["sameTx"] for x in h) and h[1]["text"].startswith("<- Pong") else 1)'
+    check $? "ping to a declared actor: Pong delivered in the same transaction (promoted)"
+  fi
   if [ "$expect" = reverted ]; then echo "$WHY" | grep -q "fee was charged" && ! echo "$WHY" | grep -q "no guest panic"; check $? "$ex/$step: the revert reason is the guest's panic message"; fi
 done < <(steps)
 

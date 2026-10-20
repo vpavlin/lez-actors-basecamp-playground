@@ -6,14 +6,24 @@
 #include "lez_http.hpp"
 #include "lez_module_util.hpp"
 #include <QTimer>
+#include <cstring>
 #include <thread>
 
 using namespace lezmod;
 
 namespace {
 
-constexpr uint16_t kLocalPort = 3040;
-const char* kLocalUrl = "http://127.0.0.1:3040";
+// LEZ's usual sequencer port. LEZ_ACTORS_CHAIN_PORT moves the app's chain, e.g. to run it next
+// to another local sequencer (prog-tui's, LEZ's `just run-sequencer-standalone`).
+uint16_t localPort() {
+    static const uint16_t port = [] {
+        const char* e = getenv("LEZ_ACTORS_CHAIN_PORT");
+        int p = e && *e ? atoi(e) : 0;
+        return uint16_t(p > 0 && p < 65536 ? p : 3040);
+    }();
+    return port;
+}
+std::string localUrl() { return "http://127.0.0.1:" + std::to_string(localPort()); }
 // LEZ's debug sequencer config (lez/sequencer/service/configs/debug), for one node in this
 // process: no gossip, no metrics listener, a block every 3 s (the debug config's 15 s makes a
 // 4-transaction deploy take a minute). The genesis funds the two dev accounts below.
@@ -64,7 +74,7 @@ bool noise(const std::string& line) {
 // =============================================================================================
 std::string LezActorsModuleImpl::localChainStatus() {
     std::lock_guard<std::recursive_mutex> lk(m_mtx);
-    return ok({{"state", m_chainState}, {"error", m_chainError}, {"rpcUrl", kLocalUrl}, {"home", m_dataDir + "/chain"},
+    return ok({{"state", m_chainState}, {"error", m_chainError}, {"rpcUrl", localUrl()}, {"home", m_dataDir + "/chain"},
                {"inProcess", m_chain != nullptr}, {"logSeq", m_tap.lastSeq()}});
 }
 
@@ -75,12 +85,12 @@ std::string LezActorsModuleImpl::startLocalChain() {
     }
     // something already answers on the port: use it rather than fail to bind
     std::string err;
-    if (auto u = lez::parseHttpUrl(kLocalUrl, &err); u && lez::rpcCall(*u, "checkHealth", json::array(), &err, 1500)) {
+    if (auto u = lez::parseHttpUrl(localUrl(), &err); u && lez::rpcCall(*u, "checkHealth", json::array(), &err, 1500)) {
         bool changed;
-        { std::lock_guard<std::recursive_mutex> lk(m_mtx); m_chainState = "external"; m_chainError = ""; changed = m_rpcUrl != kLocalUrl; m_rpcUrl = kLocalUrl; saveSettings(); writeWalletConfig(); }
+        { std::lock_guard<std::recursive_mutex> lk(m_mtx); m_chainState = "external"; m_chainError = ""; changed = m_rpcUrl != localUrl(); m_rpcUrl = localUrl(); saveSettings(); writeWalletConfig(); }
         if (changed) enqueue([this] { std::lock_guard<std::recursive_mutex> lk(m_mtx); if (m_wallet && !m_walletPw.empty()) { wallet_ffi_save(m_wallet); wallet_ffi_destroy(m_wallet); m_wallet = nullptr; WalletHandle* h = nullptr; if (wallet_ffi_open(walletConfigPath().c_str(), walletStoragePath().c_str(), m_walletPw.c_str(), &h) == FfiOperationError_Success) m_wallet = h; } });
         publish();
-        return ok({{"state", "external"}, {"note", "a sequencer already answers on 127.0.0.1:3040; using it"}});
+        return ok({{"state", "external"}, {"note", "a sequencer already answers on 127.0.0.1:" + std::to_string(localPort()) + "; using it"}});
     }
     startChainThread(false);
     return localChainStatus();
@@ -100,7 +110,7 @@ std::string LezActorsModuleImpl::resetLocalChain() {
     {
         std::lock_guard<std::recursive_mutex> lk(m_mtx);
         if (m_chainState == "starting" || m_chainState == "stopping") return fail("wait until the chain has started or stopped");
-        if (m_chainState == "external") return fail("the chain on 127.0.0.1:3040 isn't this app's; it can't reset it");
+        if (m_chainState == "external") return fail("the chain on 127.0.0.1:" + std::to_string(localPort()) + " isn't this app's; it can't reset it");
         m_chainState = "stopping"; m_chainError = "";
     }
     if (m_chainThread.joinable()) m_chainThread.join();
@@ -167,19 +177,19 @@ void LezActorsModuleImpl::startChainThread(bool stop) {
         fs::create_directories(home, ec);
         if (!writeAtomic(tmpl, kChainTemplate)) return failWith("can't write " + tmpl);
         if (sequencer_ffi_local_setup(home.c_str(), tmpl.c_str(), kFundingPublicKey) != FfiOperationError_Success) return failWith("setting up the chain failed");
-        InitializedSequencerServiceFFIResult r = sequencer_ffi_start_local(home.c_str(), kLocalPort);
-        if (r.error != FfiOperationError_Success || !r.value) return failWith("the sequencer didn't start (is port 3040 taken?)");
+        InitializedSequencerServiceFFIResult r = sequencer_ffi_start_local(home.c_str(), localPort());
+        if (r.error != FfiOperationError_Success || !r.value) return failWith("the sequencer didn't start (is port " + std::to_string(localPort()) + " taken?)");
         bool changed;
         {
             std::lock_guard<std::recursive_mutex> lk(m_mtx);
             m_chain = r.value;
             m_chainState = "running";
-            changed = m_rpcUrl != kLocalUrl;
-            m_rpcUrl = kLocalUrl;
+            changed = m_rpcUrl != localUrl();
+            m_rpcUrl = localUrl();
             saveSettings();
             writeWalletConfig();
         }
-        fprintf(stderr, "[lez_actors] local chain running on %s (home %s)\n", kLocalUrl, home.c_str());
+        fprintf(stderr, "[lez_actors] local chain running on %s (home %s)\n", localUrl().c_str(), home.c_str());
         // the wallet library reads its sequencer address at open: reopen an unlocked wallet
         if (changed) enqueue([this] {
             std::lock_guard<std::recursive_mutex> lk(m_mtx);
@@ -383,9 +393,69 @@ void LezActorsModuleImpl::runExample(Job& j) {
         if (!hello) { j.state = "failed"; j.error = "hello_world isn't deployed"; return; }
         actors.push_back(actor(a, *prog, false)); actors.push_back(actor(a, *hello, false));
         msg = lez::actorBytes(a, *hello);
+    } else if (ex == "actor_conversation") {
+        lez::Id payer; { std::lock_guard<std::recursive_mutex> lk(m_mtx); payer = *lez::parseId(m_payer); }
+        if (step == "ping" || step == "ping-undeclared") {
+            // "ping" declares account 2, so the engine runs Pong in this transaction; without it
+            // ("ping-undeclared") the engine refuses: UnboundAsyncDestination
+            actors.push_back(actor(a, *prog, false));
+            if (step == "ping") actors.push_back(actor(b, *prog, false));
+            msg = lez::acvPing(b, textBytes);
+        } else {
+            // the read targets the payer's native-token actor: a funded account
+            actors.push_back(actor(a, *prog, false)); actors.push_back(actor(payer, lez::nativeTokenId(), false));
+            lez::u128 min = step == "require-ok" ? lez::u128(1000) : step == "require-fail" ? lez::u128(1) << 100 : 0;
+            msg = step == "ask" ? lez::acvAskBalance(payer) : lez::acvRequire(payer, min);
+        }
     } else { j.state = "failed"; j.error = "unknown example"; return; }
     j.request["actors"] = actors;
     j.request["messageHex"] = lez::hex(msg);
     j.request["accounts"] = accts;
     runCall(j);
+    if (ex != "actor_conversation" || j.txHash.empty()) return;
+
+    // The conversation, read back from the chain: each hop writes one line into its own actor's
+    // state ("->" sent, "<-" received), so the lines a transaction added to each mentioned
+    // actor_conversation actor are its hops. (Its events would say the same, but a standalone
+    // chain never finalizes blocks, and the sequencer stores events only for final blocks.)
+    uint64_t txBlock = blockOfTx(j.txHash);
+    std::string pb = lez::b58(*prog);
+    json hops = json::array();
+    for (const auto& s2 : j.result.value("actors", json::array())) {
+        if (s2.value("programId", "") != pb) continue;
+        for (const auto& line : newLines(*lez::unhex(s2.value("before", "")), *lez::unhex(s2.value("after", ""))))
+            hops.push_back({{"accountId", s2.value("accountId", "")}, {"text", line}, {"sameTx", true}, {"block", txBlock}});
+    }
+    j.result["hops"] = hops;
+    j.result["txBlock"] = txBlock;
+    if (step == "ping-undeclared" && j.state == "reverted")
+        j.result["revertReason"] = "the engine refused it (UnboundAsyncDestination): an async message to a public actor must be declared in the transaction; the fee was charged";
+}
+
+// The lines `after` added to `before` (an actor_conversation state is a rolling window of lines).
+std::vector<std::string> LezActorsModuleImpl::newLines(const lez::Bytes& before, const lez::Bytes& after) {
+    auto split = [](const lez::Bytes& b) {
+        std::vector<std::string> out; std::string cur;
+        for (uint8_t c : b) { if (c == '\n') { out.push_back(cur); cur.clear(); } else cur += char(c); }
+        if (!cur.empty()) out.push_back(cur);
+        out.erase(std::remove_if(out.begin(), out.end(), [](const std::string& l) { return l.rfind("#pending", 0) == 0; }), out.end());
+        return out;
+    };
+    auto b = split(before), a = split(after);
+    // the longest tail of `before` that `after` starts with is what was already there
+    for (size_t k = std::min(a.size(), b.size()); k > 0; k--)
+        if (std::equal(b.end() - long(k), b.end(), a.begin())) return {a.begin() + long(k), a.end()};
+    return a;
+}
+
+uint64_t LezActorsModuleImpl::blockOfTx(const std::string& txHashHex) {
+    std::lock_guard<std::recursive_mutex> lk(m_mtx);
+    auto hb = lez::unhex(txHashHex);
+    if (!m_chain || !hb || hb->size() != 32) return 0;
+    FfiHashType h{}; std::copy(hb->begin(), hb->end(), h.data);
+    auto r = sequencer_ffi_query_block_by_tx_hash(m_chain, h);
+    if (r.error != FfiOperationError_Success || !r.value) return 0;
+    uint64_t block = *r.value;
+    sequencer_ffi_free_query_block_id_by_transaction(r.value);
+    return block;
 }
