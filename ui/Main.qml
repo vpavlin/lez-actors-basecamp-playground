@@ -241,6 +241,174 @@ Item {
             }
         }
     }
+    // The actors a step touched, as a table: accounts across, programs down, one cell per actor
+    // (account, program) with its state before -> after, and the step's messages as numbered
+    // arrows between the cells (solid: sync, dashed: async, from the transaction for the first).
+    component ActorMap: Item {
+        id: amap
+        property var flow: []
+        property var actors: []
+        property string jobState: ""
+        readonly property var cols: {
+            var out = [], seen = {}
+            for (var i = 0; i < flow.length; i++) for (var k of ["to", "from"]) {
+                var a = flow[i][k]; if (!a || seen[a.accountId]) continue
+                seen[a.accountId] = true; out.push({ id: a.accountId, label: a.accountLabel })
+            }
+            return out
+        }
+        readonly property var rows: {
+            var out = [], seen = {}
+            for (var i = 0; i < flow.length; i++) for (var k of ["to", "from"]) {
+                var a = flow[i][k]; if (!a || seen[a.programId]) continue
+                seen[a.programId] = true; out.push({ id: a.programId, label: a.programName })
+            }
+            return out
+        }
+        readonly property int labelW: 120
+        readonly property int txH: 74
+        readonly property int cellH: 84
+        readonly property int gapX: 120
+        readonly property int gapY: 70
+        readonly property real cellW: cols.length ? Math.min(420, (width - labelW - gapX * (cols.length - 1)) / cols.length) : 0
+        implicitHeight: txH + rows.length * cellH + (rows.length - 1) * gapY + 12
+        function colOf(id) { for (var i = 0; i < cols.length; i++) if (cols[i].id === id) return i; return -1 }
+        function rowOf(id) { for (var i = 0; i < rows.length; i++) if (rows[i].id === id) return i; return -1 }
+        function cellAt(c, r) { return { x: labelW + c * (cellW + gapX), y: txH + r * (cellH + gapY), w: cellW, h: cellH } }
+        function cellRect(a) {
+            if (!a) {   // the transaction: right above the actor its root message goes to
+                var to = flow.length ? flow[0].to : null
+                var t = to ? cellAt(colOf(to.accountId), 0) : cellAt(0, 0)
+                return { x: t.x + t.w / 2 - 110, y: 2, w: 220, h: 30 }
+            }
+            return cellAt(colOf(a.accountId), rowOf(a.programId))
+        }
+        function stateOf(accountId, programId) {
+            for (var i = 0; i < actors.length; i++) if (actors[i].accountId === accountId && actors[i].programId === programId) return actors[i]
+            return null
+        }
+        function lastLine(t) { var l = String(t).split("\n"); return l[l.length - 1] }
+        onFlowChanged: canvas.requestPaint()
+        onWidthChanged: canvas.requestPaint()
+        onJobStateChanged: canvas.requestPaint()
+
+        Rectangle {
+            readonly property var r: amap.cellRect(null)
+            x: r.x; y: r.y; width: r.w; height: r.h; radius: root.rad
+            color: root.cCard; border.color: root.cText3
+            T3 { anchors.centerIn: parent; text: "the transaction (signed, fee paid)"; color: root.cText2 }
+        }
+        Repeater {
+            model: amap.rows
+            delegate: T3 {
+                required property var modelData
+                required property int index
+                readonly property var r: amap.cellAt(0, index)
+                x: 0; y: r.y + r.h / 2 - height / 2; width: amap.labelW - 10
+                text: "program\n" + modelData.label; color: root.cText2
+            }
+        }
+        Repeater {
+            model: amap.rows.length * amap.cols.length
+            delegate: Rectangle {
+                id: cell
+                required property int index
+                readonly property var account: amap.cols[index % amap.cols.length]
+                readonly property var program: amap.rows[Math.floor(index / amap.cols.length)]
+                readonly property var st: account && program ? amap.stateOf(account.id, program.id) : null
+                readonly property bool touched: {
+                    for (var i = 0; i < amap.flow.length; i++) {
+                        var t = amap.flow[i].to, f = amap.flow[i].from
+                        if ((t && t.accountId === account.id && t.programId === program.id) || (f && f.accountId === account.id && f.programId === program.id)) return true
+                    }
+                    return false
+                }
+                // the payer's balance moves by the fee either way: not the step's effect
+                readonly property bool feeOnly: !!st && !!st.note
+                readonly property bool changed: !!st && st.changed && amap.jobState === "applied" && !feeOnly
+                readonly property var r: amap.cellAt(index % amap.cols.length, Math.floor(index / amap.cols.length))
+                x: r.x; y: r.y; width: r.w; height: r.h; radius: root.rad + 2
+                color: touched ? root.cInset : "transparent"
+                border.color: !touched ? root.cLine : changed ? root.cOk : root.cText3
+                border.width: changed ? 2 : 1
+                opacity: touched ? 1 : 0.3
+                ColumnLayout {
+                    anchors.fill: parent; anchors.margins: 6
+                    spacing: 1
+                    T3 { text: touched ? "actor (" + cell.account.label + ", " + cell.program.label + ")" : "(" + cell.account.label + ", " + cell.program.label + "): not in this step"; color: root.cText; font.weight: Font.DemiBold; Layout.fillWidth: true; elide: Text.ElideRight; wrapMode: Text.NoWrap }
+                    T3 {
+                        visible: !!cell.st
+                        Layout.fillWidth: true; elide: Text.ElideRight; wrapMode: Text.NoWrap; font.family: "monospace"
+                        text: cell.st ? "before: " + amap.lastLine(root.bytesText(cell.st.before, cell.st.beforeText)) : ""
+                    }
+                    T3 {
+                        visible: !!cell.st
+                        Layout.fillWidth: true; elide: Text.ElideRight; wrapMode: Text.NoWrap; font.family: "monospace"
+                        color: cell.changed ? root.cOk : root.cText3
+                        text: !cell.st ? "" : cell.feeOnly ? "after:  " + amap.lastLine(root.bytesText(cell.st.after, cell.st.afterText)) + "  (only the fee)"
+                              : amap.jobState !== "applied" ? "after:  unchanged (reverted)"
+                              : cell.st.changed ? "after:  " + amap.lastLine(root.bytesText(cell.st.after, cell.st.afterText)) : "after:  unchanged"
+                    }
+                    Item { Layout.fillHeight: true }
+                }
+            }
+        }
+        Canvas {
+            id: canvas
+            anchors.fill: parent
+            onPaint: {
+                var ctx = getContext("2d")
+                ctx.reset()
+                var fl = amap.flow
+                function clip(a, b, rc) {   // where the line a->b leaves the rectangle around a
+                    var t = 1, ex = b.x - a.x, ey = b.y - a.y
+                    if (ex !== 0) { var tx = ((ex > 0 ? rc.x + rc.w : rc.x) - a.x) / ex; if (tx > 0) t = Math.min(t, tx) }
+                    if (ey !== 0) { var ty = ((ey > 0 ? rc.y + rc.h : rc.y) - a.y) / ey; if (ty > 0) t = Math.min(t, ty) }
+                    return { x: a.x + ex * t, y: a.y + ey * t }
+                }
+                for (var i = 0; i < fl.length; i++) {
+                    var m = fl[i]
+                    var fr = amap.cellRect(m.from), tr = amap.cellRect(m.to)
+                    var p = { x: fr.x + fr.w / 2, y: fr.y + fr.h / 2 }, q = { x: tr.x + tr.w / 2, y: tr.y + tr.h / 2 }
+                    // a request and its reply run between the same two cells: move each line aside
+                    var dx = q.x - p.x, dy = q.y - p.y, len = Math.max(1, Math.sqrt(dx * dx + dy * dy))
+                    var nx = -dy / len, ny = dx / len, off = m.kind === "root" ? 0 : 18
+                    p = { x: p.x + nx * off, y: p.y + ny * off }; q = { x: q.x + nx * off, y: q.y + ny * off }
+                    var s0 = clip(p, q, fr), e0 = clip(q, p, tr)
+                    var bad = m.status === "panicked" || m.status === "refused"
+                    var col = bad ? String(root.cErr) : (m.status === "undone" || m.status === "never ran") ? String(root.cText3)
+                            : m.kind === "async" ? String(root.cWarn) : m.kind === "root" ? String(root.cText2) : String(root.cPrimary)
+                    ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = 2
+                    if (ctx.setLineDash) ctx.setLineDash(m.kind === "async" || m.status === "never ran" ? [7, 5] : [])
+                    ctx.beginPath(); ctx.moveTo(s0.x, s0.y); ctx.lineTo(e0.x, e0.y); ctx.stroke()
+                    if (ctx.setLineDash) ctx.setLineDash([])
+                    var ang = Math.atan2(e0.y - s0.y, e0.x - s0.x)
+                    ctx.beginPath(); ctx.moveTo(e0.x, e0.y)
+                    ctx.lineTo(e0.x - 12 * Math.cos(ang - 0.4), e0.y - 12 * Math.sin(ang - 0.4))
+                    ctx.lineTo(e0.x - 12 * Math.cos(ang + 0.4), e0.y - 12 * Math.sin(ang + 0.4))
+                    ctx.closePath(); ctx.fill()
+                    if (bad) {
+                        ctx.lineWidth = 3
+                        ctx.beginPath(); ctx.moveTo(e0.x - 9, e0.y - 9); ctx.lineTo(e0.x + 9, e0.y + 9); ctx.moveTo(e0.x + 9, e0.y - 9); ctx.lineTo(e0.x - 9, e0.y + 9); ctx.stroke()
+                    }
+                    // the number on the line, the message beside it (on the side the line was moved to)
+                    var mx = (s0.x + e0.x) / 2, my = (s0.y + e0.y) / 2
+                    ctx.beginPath(); ctx.arc(mx, my, 10, 0, 2 * Math.PI); ctx.fill()
+                    ctx.fillStyle = "#10130f"; ctx.font = "bold 11px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle"
+                    ctx.fillText(String(m.n), mx, my)
+                    var label = m.name + "  (" + (m.kind === "root" ? "from the tx" : m.kind) + (m.status !== "ok" ? ", " + m.status : "") + ")"
+                    ctx.font = "11px sans-serif"; ctx.textAlign = "left"
+                    var lw = ctx.measureText(label).width
+                    var side = (off === 0 ? 1 : 1) * (nx >= 0 ? 1 : -1)
+                    var lx = side > 0 ? mx + 16 : mx - 16 - lw
+                    lx = Math.max(2, Math.min(lx, amap.width - lw - 2))
+                    var ly = my + (Math.abs(nx) < 0.3 ? (ny > 0 ? 16 : -16) : 0)
+                    ctx.fillStyle = String(root.cBg); ctx.fillRect(lx - 3, ly - 8, lw + 6, 16)
+                    ctx.fillStyle = col; ctx.fillText(label, lx, ly)
+                }
+            }
+        }
+    }
     component Field: TextField {
         Layout.fillWidth: true; Layout.minimumWidth: 80
         color: root.cText; placeholderTextColor: root.cText3; font.pixelSize: 13
@@ -455,6 +623,7 @@ Item {
                                 readonly property string key: exCard.modelData.name + "/" + modelData.id
                                 readonly property var job: root.lastStepJob(exCard.modelData.name, modelData.id)
                                 readonly property bool running: !!job && ["applied", "failed", "reverted", "unknown"].indexOf(job.state) < 0
+                                property bool showDetails: false
                                 Layout.fillWidth: true
                                 implicitHeight: stepCol.implicitHeight + 16
                                 color: root.cInset; radius: root.rad; border.color: root.cLine
@@ -499,8 +668,13 @@ Item {
                                     }
                                     T3 { visible: !!(stepBox.job && stepBox.job.error); Layout.fillWidth: true; color: root.cErr; text: stepBox.job ? stepBox.job.error || "" : "" }
                                     T3 { visible: !!(stepBox.job && stepBox.job.result && stepBox.job.result.revertReason); Layout.fillWidth: true; color: root.cErr; text: stepBox.job && stepBox.job.result ? "revert: " + (stepBox.job.result.revertReason || "") : "" }
+                                    LogosButton {
+                                        visible: !!(stepBox.job && stepBox.job.result && stepBox.job.result.flow)
+                                        text: stepBox.showDetails ? "Hide the full states" : "Show the full states"
+                                        onClicked: stepBox.showDetails = !stepBox.showDetails
+                                    }
                                     Repeater {
-                                        model: stepBox.job && stepBox.job.result && stepBox.job.result.actors ? stepBox.job.result.actors : []
+                                        model: stepBox.job && stepBox.job.result && stepBox.job.result.actors && (stepBox.showDetails || !stepBox.job.result.flow) ? stepBox.job.result.actors : []
                                         delegate: T3 {
                                             required property var modelData
                                             required property int index
@@ -512,6 +686,20 @@ Item {
                                                   + "\n    after:  " + root.bytesText(modelData.after, modelData.afterText).replace(/\n/g, "\n            ")
                                             font.family: "monospace"
                                         }
+                                    }
+                                    // the actors and the messages between them
+                                    ActorMap {
+                                        visible: !!(stepBox.job && stepBox.job.result && stepBox.job.result.flow)
+                                        Layout.fillWidth: true
+                                        Layout.preferredHeight: implicitHeight
+                                        flow: stepBox.job && stepBox.job.result && stepBox.job.result.flow ? stepBox.job.result.flow : []
+                                        actors: stepBox.job && stepBox.job.result && stepBox.job.result.actors ? stepBox.job.result.actors : []
+                                        jobState: stepBox.job ? stepBox.job.state : ""
+                                    }
+                                    T3 {
+                                        visible: !!(stepBox.job && stepBox.job.result && stepBox.job.result.flow)
+                                        Layout.fillWidth: true
+                                        text: "Each box is an actor: one account (column) under one program (row), with its state. Arrows are messages, numbered in the order they ran, all inside one transaction. Solid: sync (runs right away). Dashed: async (runs after the sync work). Red ✕: where it panicked or the engine refused; grey: undone or never ran, because the transaction reverted."
                                     }
                                     // the conversation, hop by hop, as the program recorded it
                                     T2 {

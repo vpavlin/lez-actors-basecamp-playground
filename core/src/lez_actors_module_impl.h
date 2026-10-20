@@ -107,6 +107,7 @@ private:
     void runTransfer(Job& j);
     void runDeploy(Job& j);
     void runExample(Job& j);
+    void attachFlow(Job& j, const std::string& ex, const std::string& step, const lez::Id& a, const lez::Id& b, const lez::Id& prog);
     std::vector<std::string> newLines(const lez::Bytes& before, const lez::Bytes& after);
     uint64_t blockOfTx(const std::string& txHashHex);
     std::string sendPublic(std::vector<std::pair<lez::Id, std::pair<lez::Id, bool>>> actors, const lez::Bytes& message,

@@ -56,6 +56,14 @@ int main() {
     CHECK(png.size() == 1 + 32 + 4 + 2 && png[0] == 2 && png[33] == 2, "actor_conversation Ping{to, note}: variant 2 + id + vec");
     CHECK(findStep(*findExample("actor_conversation"), "ping-undeclared")->expect == "reverted", "an undeclared async destination is refused");
     for (const auto& e : examples()) for (const auto& st : e.steps) CHECK(st.expect == "applied" || st.expect == "reverted", "every step states its expected outcome");
+    // the actor map's message flows
+    for (const auto& e : examples()) for (const auto& st : e.steps) {
+        StepFlow f = flowFor(e.name, st.id);
+        CHECK(!f.messages.empty() && f.messages[0].from == "tx" && f.messages[0].kind == "root", "every step's flow starts with the transaction's root message");
+        CHECK((st.expect == "reverted") == (f.failsAt > 0), "a step expected to revert names the message that fails");
+    }
+    CHECK(flowFor("actor_conversation", "ask").messages.size() == 3 && flowFor("actor_conversation", "ask").messages[2].to == "A/prog", "ask: request, ReadState, and the reply back to the asker");
+    CHECK(flowFor("actor_conversation", "ping-undeclared").refused, "the undeclared ping is an engine refusal");
     std::printf("%d passed, %d failed\n", passes, fails);
     return fails ? 1 : 0;
 }

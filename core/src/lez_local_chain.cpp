@@ -412,6 +412,7 @@ void LezActorsModuleImpl::runExample(Job& j) {
     j.request["messageHex"] = lez::hex(msg);
     j.request["accounts"] = accts;
     runCall(j);
+    attachFlow(j, ex, step, a, b, *prog);
     if (ex != "actor_conversation" || j.txHash.empty()) return;
 
     // The conversation, read back from the chain: each hop writes one line into its own actor's
@@ -430,6 +431,37 @@ void LezActorsModuleImpl::runExample(Job& j) {
     j.result["txBlock"] = txBlock;
     if (step == "ping-undeclared" && j.state == "reverted")
         j.result["revertReason"] = "the engine refused it (UnboundAsyncDestination): an async message to a public actor must be declared in the transaction; the fee was charged";
+}
+
+// The step's messages, resolved to real actors, each with what became of it, for the actor map.
+void LezActorsModuleImpl::attachFlow(Job& j, const std::string& ex, const std::string& step, const lez::Id& a, const lez::Id& b, const lez::Id& prog) {
+    lez::StepFlow f = lez::flowFor(ex, step);
+    if (f.messages.empty() || !j.result.is_object()) return;
+    lez::Id payer; { std::lock_guard<std::recursive_mutex> lk(m_mtx); payer = *lez::parseId(m_payer); }
+    auto hello = exampleProgram("hello_world");
+    auto actorOf = [&](const std::string& sym) -> json {
+        if (sym == "tx") return nullptr;
+        auto slash = sym.find('/');
+        std::string acc = sym.substr(0, slash), pr = sym.substr(slash + 1);
+        lez::Id account = acc == "A" ? a : acc == "B" ? b : payer;
+        lez::Id program = pr == "native" ? lez::nativeTokenId() : pr == "hello" && hello ? *hello : prog;
+        return {{"accountId", lez::b58(account)}, {"programId", lez::b58(program)},
+                {"accountLabel", acc == "A" ? "example account 1" : acc == "B" ? "example account 2" : "payer"},
+                {"programName", pr == "native" ? "native token" : pr == "hello" ? "hello_world" : ex}};
+    };
+    bool applied = j.state == "applied";
+    json msgs = json::array();
+    for (size_t i = 0; i < f.messages.size(); i++) {
+        int n = int(i) + 1;
+        const auto& m = f.messages[i];
+        std::string status = applied ? "ok"
+            : f.failsAt == 0 ? "undone"
+            : n < f.failsAt ? "undone"
+            : n == f.failsAt ? (f.refused ? "refused" : "panicked")
+            : "never ran";
+        msgs.push_back({{"n", n}, {"from", actorOf(m.from)}, {"to", actorOf(m.to)}, {"kind", m.kind}, {"name", m.name}, {"status", status}});
+    }
+    j.result["flow"] = msgs;
 }
 
 // The lines `after` added to `before` (an actor_conversation state is a rolling window of lines).

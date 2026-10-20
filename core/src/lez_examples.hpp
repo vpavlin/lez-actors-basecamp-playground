@@ -11,6 +11,14 @@ namespace lez {
 // core/examples/*.bin, embedded at build time (embed_examples.cmake)
 std::pair<const uint8_t*, size_t> exampleElf(const char* name);
 
+// One message of a step, between actors written as "<account>/<program>": accounts A and B
+// (example accounts 1 and 2) or payer; programs prog (the example itself), native (the native
+// token) or hello (hello_world). "tx" is the transaction delivering the first message.
+struct FlowMsg {
+    std::string from, to;
+    std::string kind;   // "root", "sync" or "async"
+    std::string name;
+};
 struct ExampleStep {
     std::string id, label;
     std::string expect;     // "applied" or "reverted"
@@ -128,6 +136,42 @@ inline const Example* findExample(const std::string& name) {
 inline const ExampleStep* findStep(const Example& e, const std::string& id) {
     for (const auto& s : e.steps) if (s.id == id) return &s;
     return nullptr;
+}
+
+// The messages a step sends, in delivery order, for the app's actor map. failsAt is the message
+// (1-based) that panics, or that the engine refuses, in a step expected to revert.
+struct StepFlow {
+    std::vector<FlowMsg> messages;
+    int failsAt = 0;
+    bool refused = false;
+};
+inline StepFlow flowFor(const std::string& ex, const std::string& step) {
+    if (ex == "hello_world") return {{{"tx", "A/prog", "root", "Write the text"}}};
+    if (ex == "hello_world_with_authorization") {
+        if (step == "unsigned") return {{{"tx", "A/prog", "root", "the text (account 1 doesn't sign)"}}, 1};
+        return {{{"tx", "A/prog", "root", "the text (account 1 signs)"}}};
+    }
+    if (ex == "hello_world_with_move_function") {
+        if (step == "write") return {{{"tx", "A/prog", "root", "Write"}}};
+        if (step == "append-direct") return {{{"tx", "B/prog", "root", "Append (not from the program)"}}, 1};
+        StepFlow f{{{"tx", "A/prog", "root", "MoveData { data, to: account 2 }"}, {"A/prog", "B/prog", "sync", "Append(data)"}}};
+        if (step == "move-wrong") f.failsAt = 1;   // the source refuses before sending
+        return f;
+    }
+    if (ex == "simple_tail_call")
+        return {{{"tx", "A/prog", "root", "callee = (account 1, hello_world)"}, {"A/prog", "A/hello", "sync", "\"Hello from tail call\""}}};
+    if (ex == "actor_conversation") {
+        if (step == "ping" || step == "ping-undeclared") {
+            StepFlow f{{{"tx", "A/prog", "root", "Ping { to: account 2 }"}, {"A/prog", "B/prog", "async", "Pong"}}};
+            if (step == "ping-undeclared") { f.failsAt = 2; f.refused = true; }
+            return f;
+        }
+        std::string first = step == "ask" ? "AskBalance { of: payer }" : step == "require-ok" ? "Require { of: payer, min: 1000 }" : "Require { of: payer, min: 2^100 }";
+        StepFlow f{{{"tx", "A/prog", "root", first}, {"A/prog", "payer/native", "sync", "ReadState"}, {"payer/native", "A/prog", "sync", "StateReply { balance }"}}};
+        if (step == "require-fail") f.failsAt = 3;   // the reply handler's check panics
+        return f;
+    }
+    return {};
 }
 
 // borsh messages of the example programs
