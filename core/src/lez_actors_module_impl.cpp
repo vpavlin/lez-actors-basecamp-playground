@@ -48,6 +48,7 @@ void LezActorsModuleImpl::onContextReady() {
     setupDataDir();
     loadSettings();
     if (const char* u = getenv("LEZ_RPC_URL"); u && *u) m_rpcUrl = u;
+    if (const char* u = getenv("LEZ_INDEXER_URL"); u && *u) m_indexerUrl = u;
     writeWalletConfig();
     // the built-ins: the engine's two fixed ids and the guests at SHA-256(prefix + name)
     std::vector<Program> builtins = {{"native token", lez::nativeTokenId(), true}, {"program_loader", lez::programLoaderId(), true}};
@@ -90,6 +91,7 @@ void LezActorsModuleImpl::loadSettings() {
     json s = json::parse(f, nullptr, false);
     if (!s.is_object()) return;
     m_rpcUrl = s.value("rpcUrl", m_rpcUrl);
+    m_indexerUrl = s.value("indexerUrl", m_indexerUrl);
     m_payer = s.value("payer", "");
     m_selected = s.value("selected", "");
     for (const auto& a : s.value("helperAccounts", json::array())) if (a.is_string()) m_helperAccounts.push_back(a);
@@ -105,7 +107,7 @@ void LezActorsModuleImpl::loadSettings() {
 void LezActorsModuleImpl::saveSettings() {
     json progs = json::array();
     for (const auto& p : m_programs) if (!p.builtin) progs.push_back({{"name", p.name}, {"id", lez::b58(p.id)}});
-    writeAtomic(m_dataDir + "/settings.json", json{{"rpcUrl", m_rpcUrl}, {"payer", m_payer}, {"selected", m_selected}, {"programs", progs},
+    writeAtomic(m_dataDir + "/settings.json", json{{"rpcUrl", m_rpcUrl}, {"indexerUrl", m_indexerUrl}, {"payer", m_payer}, {"selected", m_selected}, {"programs", progs},
                                                    {"helperAccounts", m_helperAccounts}, {"exampleAccounts", m_exampleAccounts},
                                                    {"examplePrograms", m_examplePrograms}}.dump(1));
 }
@@ -167,7 +169,7 @@ json LezActorsModuleImpl::buildSnapshot() {
     bool exists = fs::exists(walletStoragePath());
     std::vector<std::string> visible;
     for (const auto& a : m_accounts) if (std::find(m_helperAccounts.begin(), m_helperAccounts.end(), a) == m_helperAccounts.end()) visible.push_back(a);
-    return {{"rpcUrl", m_rpcUrl}, {"payer", m_payer}, {"selected", m_selected}, {"wallet", {{"exists", exists}, {"open", m_wallet != nullptr}, {"accounts", visible}}},
+    return {{"rpcUrl", m_rpcUrl}, {"indexerUrl", m_indexerUrl}, {"payer", m_payer}, {"selected", m_selected}, {"wallet", {{"exists", exists}, {"open", m_wallet != nullptr}, {"accounts", visible}}},
             {"jobs", jobs}, {"dataDir", m_dataDir}, {"exampleAccounts", m_exampleAccounts}, {"examplePrograms", m_examplePrograms},
             {"localChain", {{"state", m_chainState}, {"error", m_chainError}, {"logSeq", m_tap.lastSeq()}}}};
 }
@@ -185,6 +187,55 @@ std::string LezActorsModuleImpl::setEndpoint(std::string rpcUrl) {
     // the wallet library reads its sequencer from the config at open: reopen on the next unlock
     publish();
     return ok({{"rpcUrl", rpcUrl}, {"note", "unlock the wallet again for it to use the new address"}});
+}
+
+std::string LezActorsModuleImpl::setIndexer(std::string indexerUrl) {
+    indexerUrl = unquote(indexerUrl);
+    std::string err;
+    if (!lez::parseHttpUrl(indexerUrl, &err)) return fail(err);
+    { std::lock_guard<std::recursive_mutex> lk(m_mtx); m_indexerUrl = indexerUrl; saveSettings(); }
+    publish();
+    return ok({{"indexerUrl", indexerUrl}});
+}
+
+// Read program events from the indexer. requestJson is an optional filter:
+// {programId, selector (hex), fromBlock, toBlock, txHash (hex)}. Events are only queryable once
+// their block is FINAL, so on a non-finalizing dev chain this returns only genesis events; the
+// Guided flow falls back to the actor-state diff until the finalizing stack lands.
+std::string LezActorsModuleImpl::getEvents(std::string requestJson) {
+    json req = json::parse(unquote(requestJson), nullptr, false);
+    if (!req.is_object()) req = json::object();
+    std::string url; { std::lock_guard<std::recursive_mutex> lk(m_mtx); url = m_indexerUrl; }
+    std::string err;
+    auto u = lez::parseHttpUrl(url, &err);
+    if (!u) return fail("the indexer URL is not set or is invalid (" + url + "): " + err);
+
+    // Only the fields that are set; the indexer denies unknown fields. tx_hash alone needs no range,
+    // otherwise from_block is required (an unbounded query is rejected).
+    json filter = json::object();
+    if (req.contains("fromBlock") && req["fromBlock"].is_number()) filter["from_block"] = req["fromBlock"];
+    if (req.contains("toBlock") && req["toBlock"].is_number()) filter["to_block"] = req["toBlock"];
+    if (req.contains("txHash") && req["txHash"].is_string() && !req["txHash"].get<std::string>().empty()) filter["tx_hash"] = req["txHash"];
+    if (req.contains("programId") && req["programId"].is_string() && !req["programId"].get<std::string>().empty()) filter["program_account_id"] = req["programId"];
+    if (req.contains("selector") && req["selector"].is_string() && !req["selector"].get<std::string>().empty()) filter["selector"] = req["selector"];
+
+    auto result = lez::rpcCall(*u, "getEvents", json::array({filter}), &err, 4000);
+    if (!result) {
+        std::string hint;
+        if (err.find("UncoveredEventQuery") != std::string::npos)
+            hint = " (this indexer keeps no events for that query: it needs event_filter \"archival\", or a declared program and selector)";
+        return fail(err + hint);
+    }
+    auto events = lez::parseEvents(*result);
+    json arr = json::array();
+    for (const auto& e : events) {
+        json j = {{"blockId", e.blockId}, {"txIndex", e.txIndex}, {"txHash", e.txHash},
+                  {"program", e.programAccountId}, {"programName", programName(e.programAccountId)},
+                  {"selector", e.selector}, {"selectorName", lez::selectorName(e.selector)}};
+        if (auto t = lez::printable(e.data)) j["text"] = *t; else j["hex"] = lez::hex(e.data);
+        arr.push_back(std::move(j));
+    }
+    return ok({{"events", arr}, {"indexerUrl", url}});
 }
 
 std::string LezActorsModuleImpl::health() {

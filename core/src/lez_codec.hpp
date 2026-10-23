@@ -187,4 +187,66 @@ inline TransferOutcome transferOutcome(u128 senderBefore, u128 senderAfter, u128
     return spent > 0 ? TransferOutcome::Reverted : TransferOutcome::Unchanged;
 }
 
+// ---- events (getEvents, from the INDEXER, not the sequencer) ------------------------------------
+// The indexer's getEvents returns a list of {block_id, tx_index, tx_hash (hex), program_account_id
+// (base58), selector (hex, 8 bytes), data (base64)}. Events are stored only for FINAL blocks, so a
+// non-finalizing dev chain returns only genesis events (docs/LEZ-V04-NOTES.md section 2); an indexer
+// whose event_filter keeps nothing answers every query with JSON-RPC -32602 UncoveredEventQuery.
+inline Bytes b64decode(const std::string& s) {
+    static const std::string A = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    Bytes out; int val = 0, bits = -8;
+    for (unsigned char c : s) {
+        auto p = A.find(char(c));
+        if (p == std::string::npos) continue;   // skip '=' and whitespace
+        val = (val << 6) | int(p); bits += 6;
+        if (bits >= 0) { out.push_back(uint8_t((val >> bits) & 0xFF)); bits -= 8; }
+    }
+    return out;
+}
+
+struct EventRecord {
+    uint64_t blockId = 0;
+    uint32_t txIndex = 0;
+    std::string txHash;            // hex
+    std::string programAccountId;  // base58
+    std::string selector;          // hex, 8 bytes
+    Bytes data;                    // decoded from base64
+};
+inline std::vector<EventRecord> parseEvents(const json& v) {
+    std::vector<EventRecord> out;
+    if (!v.is_array()) return out;
+    for (const auto& e : v) {
+        if (!e.is_object()) continue;
+        EventRecord r;
+        if (e.contains("block_id") && e["block_id"].is_number_unsigned()) r.blockId = e["block_id"].get<uint64_t>();
+        if (e.contains("tx_index") && e["tx_index"].is_number_unsigned()) r.txIndex = e["tx_index"].get<uint32_t>();
+        if (e.contains("tx_hash") && e["tx_hash"].is_string()) r.txHash = e["tx_hash"].get<std::string>();
+        if (e.contains("program_account_id") && e["program_account_id"].is_string()) r.programAccountId = e["program_account_id"].get<std::string>();
+        if (e.contains("selector") && e["selector"].is_string()) r.selector = e["selector"].get<std::string>();
+        if (e.contains("data") && e["data"].is_string()) r.data = b64decode(e["data"].get<std::string>());
+        out.push_back(std::move(r));
+    }
+    return out;
+}
+
+// A friendly name for an 8-byte selector (hex). By convention a selector is the first 8 bytes of
+// sha256("<program>::<Event>"), but a program may also use a literal ASCII tag (actor_conversation
+// uses b"acv_hop_"). Known LEZ selectors are named; a printable-ASCII selector is shown as its text;
+// otherwise the empty string (the UI falls back to the raw hex).
+inline std::string selectorName(const std::string& hexSel) {
+    static const std::map<std::string, std::string> known = {
+        {"6163765f686f705f", "hop"},               // actor_conversation, b"acv_hop_"
+        {"cd499ae548cdf23d", "bridge::Deposit"},
+        {"874b4979947b40e2", "bridge::Withdraw"},
+    };
+    if (auto it = known.find(hexSel); it != known.end()) return it->second;
+    if (hexSel.size() == 16) {   // decode the 8 bytes and show them if printable ASCII
+        auto hx = [](char c) -> int { if (c >= '0' && c <= '9') return c - '0'; if (c >= 'a' && c <= 'f') return c - 'a' + 10; if (c >= 'A' && c <= 'F') return c - 'A' + 10; return -1; };
+        Bytes b; bool okHex = true;
+        for (size_t i = 0; i + 1 < hexSel.size(); i += 2) { int hi = hx(hexSel[i]), lo = hx(hexSel[i + 1]); if (hi < 0 || lo < 0) { okHex = false; break; } b.push_back(uint8_t(hi * 16 + lo)); }
+        if (okHex) if (auto p = printable(b)) { std::string t = *p; while (!t.empty() && (t.back() == '_' || t.back() == ' ')) t.pop_back(); if (!t.empty()) return t; }
+    }
+    return "";
+}
+
 }  // namespace lez
