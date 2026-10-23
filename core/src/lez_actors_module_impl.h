@@ -37,6 +37,7 @@ public:
     // --- state ---
     std::string snapshot();
     std::string setEndpoint(std::string rpcUrl);
+    std::string setIndexer(std::string indexerUrl);
     std::string health();
     std::string feeReserveEstimate();
 
@@ -53,6 +54,7 @@ public:
     // --- chain reads ---
     std::string getAccount(std::string accountId);
     std::string resolveProgram(std::string headerId);
+    std::string getEvents(std::string requestJson);
 
     // --- programs the UI can label ---
     std::string listKnownPrograms();
@@ -133,6 +135,7 @@ private:
     std::recursive_mutex m_mtx;
     std::string m_dataDir;
     std::string m_rpcUrl = "http://127.0.0.1:3040";
+    std::string m_indexerUrl = "http://127.0.0.1:8779";
     std::string m_payer, m_selected;
     std::vector<Program> m_programs;
     std::map<std::string, Job> m_jobs;
