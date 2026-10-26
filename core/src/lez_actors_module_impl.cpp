@@ -34,6 +34,7 @@ LezActorsModuleImpl::~LezActorsModuleImpl() {
     m_stop = true;
     m_qCv.notify_all();
     if (m_worker.joinable()) m_worker.join();
+    if (m_eventsThread.joinable()) m_eventsThread.join();
     if (m_wallet) { wallet_ffi_save(m_wallet); wallet_ffi_destroy(m_wallet); m_wallet = nullptr; }
     if (m_chainThread.joinable()) m_chainThread.join();
     if (m_chain) { sequencer_ffi_stop_sequencer(m_chain); m_chain = nullptr; }
@@ -59,6 +60,7 @@ void LezActorsModuleImpl::onContextReady() {
     m_programs.insert(m_programs.end(), user.begin(), user.end());
     m_loop = new QTimer();   // a QObject on the module's thread, for onLoop()
     m_worker = std::thread([this] { workerLoop(); });
+    m_eventsThread = std::thread([this] { eventsLoop(); });
     fprintf(stderr, "[lez_actors] ready: data %s, rpc %s\n", m_dataDir.c_str(), m_rpcUrl.c_str());
 }
 

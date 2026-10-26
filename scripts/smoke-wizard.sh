@@ -97,6 +97,26 @@ check $? "example account 2 holds the moved bytes under hello_world_with_move_fu
 
 L2=$(call localChainLog str:0); [ "$(echo "$L2" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["lines"]))')" -gt 0 ]; check $? "localChainLog returns the chain's log"
 
+echo "== program events (the finalized record)"
+for i in $(seq 1 45); do EV=$(call events 'str:{"selector":"6163765f686f705f"}'); N=$(echo "$EV" | field matching); [ "${N:-0}" -ge 4 ] && break; sleep 2; done
+echo "  $(echo "$EV" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("matching"), "hop events, finalized up to block", d.get("indexerTip")); [print("   ", e["block"], e.get("selectorName"), "|", e.get("text","")[:90]) for e in d.get("events",[])[-4:]]')"
+[ "${N:-0}" -ge 4 ]; check $? "events() has the actor_conversation hops' events once their blocks finalize ($N)"
+SNAP=$(call snapshot)
+echo "$SNAP" | python3 -c 'import json,sys
+jobs=[j for j in json.load(sys.stdin)["jobs"] if j["request"].get("example")=="actor_conversation" and j["request"].get("step")=="ask" and j["state"]=="applied"]
+h=jobs[0]["result"]["hops"] if jobs else []
+sys.exit(0 if h and all("finalizedBlock" in x and x.get("eventText") for x in h) else 1)'
+check $? "the ask step's hops are stamped finalized, each with its event's text"
+echo "$SNAP" | python3 -c 'import json,sys
+jobs=[j for j in json.load(sys.stdin)["jobs"] if j["request"].get("example")=="actor_conversation" and j["request"].get("step")=="ask" and j["state"]=="applied"]
+h=jobs[0]["result"]["hops"] if jobs else []
+ok=bool(h) and all(x.get("block")==x.get("finalizedBlock") for x in h)
+ok or print("   hops:", [(x.get("block"), x.get("finalizedBlock")) for x in h])
+sys.exit(0 if ok else 1)'
+check $? "a hop's block (the sequencer's) is the block its event finalized in"
+echo "$(call events 'str:{"program":"actor_conversation","selector":"0000000000000000"}')" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)["matching"]==0 else 1)'
+check $? "events() filters by program and selector"
+
 echo "== stop + restart keeps the chain"
 call stopLocalChain >/dev/null
 for i in $(seq 1 30); do ST=$(call localChainStatus | field state); [ "$ST" = stopped ] && break; sleep 1; done

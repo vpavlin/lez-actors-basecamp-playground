@@ -396,6 +396,8 @@ inline bool childAlive(pid_t pid) {
 // SIGTERM, then SIGKILL after `graceMs`; reaps it.
 inline void stopChild(pid_t& pid, int graceMs = 5000) {
     if (pid <= 0) return;
+    int st0 = 0;
+    if (waitpid(pid, &st0, WNOHANG) != 0) { pid = 0; return; }   // gone (or reaped): never signal a reused pid
     kill(pid, SIGTERM);
     for (int waited = 0; waited < graceMs; waited += 100) {
         int st = 0;

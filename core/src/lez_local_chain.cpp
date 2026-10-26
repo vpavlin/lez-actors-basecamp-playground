@@ -360,24 +360,40 @@ void LezActorsModuleImpl::runDeploy(Job& j) {
         finishJob(j.id, [st = j.state](Job& x) { x.state = st; });
         // one header and up to kMaxSegments segment accounts, all fresh wallet accounts. The
         // segment count must match ceil(user_elf / 96 KiB); a wrong count is refused before
-        // anything is sent, so try them in turn with the same accounts.
+        // anything is sent, so try them in turn with the same accounts. Any other failure means
+        // the count was right and an upload went wrong (seen: "segment 0 transaction did not
+        // finalize" on a healthy chain); a partial upload can't be resumed (wallet FIXME), so
+        // start again at that count with fresh accounts, twice at most.
+        auto freshAccounts = [&](std::vector<FfiBytes32>& accts) -> bool {
+            for (auto& a : accts) {
+                if (wallet_ffi_create_account_public(m_wallet, &a) != FfiOperationError_Success) return false;
+                std::lock_guard<std::recursive_mutex> lk(m_mtx);
+                m_helperAccounts.push_back(lez::b58(fromFfi(a)));
+            }
+            wallet_ffi_save(m_wallet);
+            { std::lock_guard<std::recursive_mutex> lk(m_mtx); saveSettings(); }
+            return true;
+        };
         std::vector<FfiBytes32> accts(1 + kMaxSegments);
-        for (auto& a : accts) {
-            if (wallet_ffi_create_account_public(m_wallet, &a) != FfiOperationError_Success) { j.state = "failed"; j.error = "the wallet couldn't create deploy accounts"; return; }
-            std::lock_guard<std::recursive_mutex> lk(m_mtx);
-            m_helperAccounts.push_back(lez::b58(fromFfi(a)));
-        }
-        wallet_ffi_save(m_wallet);
-        { std::lock_guard<std::recursive_mutex> lk(m_mtx); saveSettings(); }
+        if (!freshAccounts(accts)) { j.state = "failed"; j.error = "the wallet couldn't create deploy accounts"; return; }
         FfiBytes32 p = ffiId(payer);
         bool done = false;
         std::string tx;
-        int used = 0;
+        int used = 0, retries = 0;
         for (int segs = 1; segs <= kMaxSegments && !done; segs++) {
+            long long before = m_tap.lastSeq();
             FfiTransactionResult res{};
             FfiOperationError rc = wallet_ffi_program_loader_deploy(m_wallet, &accts[0], &accts[1], size_t(segs), elf.first, elf.second, false, &p, &res);
             if (rc == FfiOperationError_Success) { done = true; used = segs; tx = res.tx_hash ? res.tx_hash : ""; }
             wallet_ffi_free_transaction_result(&res);
+            if (done) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            std::string why = m_tap.ffiErrorSince(before);
+            if (why.find("segment(s) but") != std::string::npos || why.empty()) continue;   // not this count
+            if (retries++ >= 2) break;
+            fprintf(stderr, "[lez_actors] deploying %s with %d segments failed (%s); again with fresh accounts\n", n.c_str(), segs, why.c_str());
+            if (!freshAccounts(accts)) break;
+            segs--;   // the same count again
         }
         if (!done) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -491,8 +507,9 @@ void LezActorsModuleImpl::runExample(Job& j) {
 
     // The conversation, read back from the chain: each hop writes one line into its own actor's
     // state ("->" sent, "<-" received), so the lines a transaction added to each mentioned
-    // actor_conversation actor are its hops. (Its events would say the same, but a standalone
-    // chain never finalizes blocks, and the sequencer stores events only for final blocks.)
+    // actor_conversation actor are its hops, drawn at once. Each hop also emits an acv_hop_ event;
+    // those arrive when the block finalizes, a block or two later, and stamp the hops in order
+    // (stampHops). The state lines say which actor a hop ran on; the events don't carry the account.
     uint64_t txBlock = blockOfTx(j.txHash);
     std::string pb = lez::b58(*prog);
     json hops = json::array();
@@ -503,6 +520,17 @@ void LezActorsModuleImpl::runExample(Job& j) {
     }
     j.result["hops"] = hops;
     j.result["txBlock"] = txBlock;
+    // its events may already be in (finality can beat this read): stamp the hops now
+    {
+        std::vector<json> mine;
+        { std::lock_guard<std::recursive_mutex> lk(m_mtx); for (const auto& e : m_events) if (e.value("txHash", "") == j.txHash) mine.push_back(e); }
+        json evs = json::array();
+        for (const auto& e : mine) if (e.value("selector", "") == "6163765f686f705f") evs.push_back({{"block", e["block"]}, {"text", e.value("text", "")}});
+        if (!evs.empty()) {
+            j.result["hopEvents"] = evs; j.result["finalizedBlock"] = evs[0]["block"];
+            for (size_t i = 0; i < hops.size() && i < evs.size(); i++) { j.result["hops"][i]["finalizedBlock"] = evs[i]["block"]; j.result["hops"][i]["eventText"] = evs[i]["text"]; }
+        }
+    }
     if (step == "ping-undeclared" && j.state == "reverted")
         j.result["revertReason"] = "the engine refused it (UnboundAsyncDestination): an async message to a public actor must be declared in the transaction; the fee was charged";
 }
@@ -577,6 +605,17 @@ std::vector<std::string> LezActorsModuleImpl::newLines(const lez::Bytes& before,
 }
 
 uint64_t LezActorsModuleImpl::blockOfTx(const std::string& txHashHex) {
+    // The sequencer's getTransaction answers [tx, block id]. core_ffi's
+    // sequencer_ffi_query_block_by_tx_hash gave a later block than the one holding the tx (53 for a
+    // tx in 51, 2026-10-26, logos-blockchain 6b33abb3), so it's only the fallback.
+    {
+        std::string err, rpc;
+        { std::lock_guard<std::recursive_mutex> lk(m_mtx); rpc = m_rpcUrl; }
+        if (auto u = lez::parseHttpUrl(rpc, &err)) {
+            auto r = lez::rpcCall(*u, "getTransaction", json::array({txHashHex}), &err, 3000);
+            if (r && r->is_array() && r->size() >= 2 && (*r)[1].is_number_unsigned()) return (*r)[1].get<uint64_t>();
+        }
+    }
     std::lock_guard<std::recursive_mutex> lk(m_mtx);
     auto hb = lez::unhex(txHashHex);
     if (!m_chain || !hb || hb->size() != 32) return 0;
@@ -586,4 +625,156 @@ uint64_t LezActorsModuleImpl::blockOfTx(const std::string& txHashHex) {
     uint64_t block = *r.value;
     sequencer_ffi_free_query_block_id_by_transaction(r.value);
     return block;
+}
+
+// =============================================================================================
+// program events: the finalized record (ADR 0003)
+// =============================================================================================
+// The sequencer stores events only for finalized blocks, and the indexer reads finalized blocks
+// off the Bedrock node, so this list trails the chain's head by a block or two: it's the
+// canonical record, where a step's state diff is the instant preview. A thread polls the local
+// chain's indexer every 2 s from a cursor, in <=1000-block windows (the indexer's span cap), and
+// keeps the newest kEventsKept.
+namespace {
+
+constexpr size_t kEventsKept = 2000;
+
+std::string b64decode(const std::string& in) {
+    static const std::string tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out; int val = 0, bits = -8;
+    for (unsigned char c : in) {
+        if (c == '=') break;
+        auto p = tbl.find(char(c));
+        if (p == std::string::npos) continue;
+        val = (val << 6) + int(p); bits += 6;
+        if (bits >= 0) { out.push_back(char((val >> bits) & 0xFF)); bits -= 8; }
+    }
+    return out;
+}
+
+bool printable(const std::string& s) {
+    if (s.empty()) return false;
+    for (unsigned char c : s) if (c < 0x20 && c != '\n' && c != '\t') return false;
+    return s.find('\x7f') == std::string::npos;
+}
+
+// Known selectors by name; an 8-byte ASCII literal (b"acv_hop_") as its text; else raw hex (the
+// sha256("<program>::<Event>") convention can't be reversed without the event's name).
+std::string selectorName(const std::string& hex) {
+    static const std::map<std::string, std::string> known = {
+        {"6163765f686f705f", "actor_conversation hop"},
+        {"98abe0ff895d39c5", "hello_event::Greeted"},
+        {"cd499ae548cdf23d", "bridge::Deposit"},
+    };
+    if (auto it = known.find(hex); it != known.end()) return it->second;
+    auto b = lez::unhex(hex);
+    if (b && b->size() == 8) {
+        std::string t(b->begin(), b->end());
+        bool ascii = true;
+        for (unsigned char c : t) if (c < 0x21 || c > 0x7e) ascii = false;
+        if (ascii) return "\"" + t + "\"";
+    }
+    return "";
+}
+
+}  // namespace
+
+void LezActorsModuleImpl::eventsLoop() {
+    while (!m_stop) {
+        for (int i = 0; i < 20 && !m_stop; i++) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (m_stop) break;
+        refreshEvents();
+    }
+}
+
+void LezActorsModuleImpl::refreshEvents() {
+    bool running;
+    { std::lock_guard<std::recursive_mutex> lk(m_mtx); running = m_chainState == "running" && lez::childAlive(m_indexerPid); }
+    if (!running) return;
+    std::string err;
+    auto url = lez::parseHttpUrl(indexerUrl(), &err);
+    if (!url) return;
+    auto st = lez::rpcCall(*url, "getStatus", json::array(), &err, 2000);
+    if (!st || !st->is_object()) { std::lock_guard<std::recursive_mutex> lk(m_mtx); m_eventsError = err; return; }
+    long long tip = st->contains("indexed_block_id") && (*st)["indexed_block_id"].is_number() ? (*st)["indexed_block_id"].get<long long>() : -1;
+    std::vector<json> fresh;
+    {
+        std::lock_guard<std::recursive_mutex> lk(m_mtx);
+        // a reset chain starts again from genesis: so does the list
+        if (tip >= 0 && m_indexerTip >= 0 && tip < m_indexerTip) { m_events.clear(); m_eventsFrom = 0; }
+        m_indexerTip = tip;
+        m_eventsError = "";
+    }
+    for (int page = 0; page < 5 && tip >= 0; page++) {
+        uint64_t from; { std::lock_guard<std::recursive_mutex> lk(m_mtx); from = m_eventsFrom; }
+        if ((long long)from > tip) break;
+        uint64_t to = std::min<uint64_t>(from + 999, uint64_t(tip));
+        auto r = lez::rpcCall(*url, "getEvents", json::array({{{"from_block", from}, {"to_block", to}}}), &err, 4000);
+        if (!r || !r->is_array()) { std::lock_guard<std::recursive_mutex> lk(m_mtx); m_eventsError = err; break; }
+        for (const auto& e : *r) {
+            if (!e.is_object()) continue;
+            std::string data = b64decode(e.value("data", ""));
+            std::string sel = e.value("selector", ""), prog = e.value("program_account_id", "");
+            json row = {{"block", e.value("block_id", 0)}, {"txIndex", e.value("tx_index", 0)}, {"txHash", e.value("tx_hash", "")},
+                        {"programId", prog}, {"programName", programName(prog)}, {"selector", sel}, {"selectorName", selectorName(sel)},
+                        {"dataHex", lez::hex(lez::Bytes(data.begin(), data.end()))}};
+            if (printable(data)) row["text"] = data;
+            fresh.push_back(row);
+        }
+        std::lock_guard<std::recursive_mutex> lk(m_mtx);
+        m_eventsFrom = to + 1;
+    }
+    if (fresh.empty()) return;
+    {
+        std::lock_guard<std::recursive_mutex> lk(m_mtx);
+        m_events.insert(m_events.end(), fresh.begin(), fresh.end());
+        if (m_events.size() > kEventsKept) m_events.erase(m_events.begin(), m_events.begin() + long(m_events.size() - kEventsKept));
+    }
+    stampHops(fresh);
+    if (*m_alive) onLoop([this] { publish(); });
+}
+
+// A step's hops are drawn at once from the actors' state diff; when the step's transaction
+// finalizes, its acv_hop_ events arrive, in execution order, the same order as the hops: stamp
+// each hop with the block that finalized it and the event's own sentence.
+void LezActorsModuleImpl::stampHops(const std::vector<json>& fresh) {
+    std::map<std::string, std::vector<const json*>> byTx;
+    for (const auto& e : fresh) if (e.value("selector", "") == "6163765f686f705f") byTx[e.value("txHash", "")].push_back(&e);
+    if (byTx.empty()) return;
+    std::lock_guard<std::recursive_mutex> lk(m_mtx);
+    for (auto& [id, j] : m_jobs) {
+        auto it = byTx.find(j.txHash);
+        if (it == byTx.end() || j.txHash.empty() || !j.result.is_object()) continue;
+        json evs = json::array();
+        for (const json* e : it->second) evs.push_back({{"block", (*e)["block"]}, {"text", e->value("text", "")}});
+        j.result["hopEvents"] = evs;
+        j.result["finalizedBlock"] = (*it->second.front())["block"];
+        if (j.result.contains("hops") && j.result["hops"].is_array()) {
+            auto& hops = j.result["hops"];
+            for (size_t i = 0; i < hops.size() && i < evs.size(); i++) {
+                hops[i]["finalizedBlock"] = evs[i]["block"];
+                hops[i]["eventText"] = evs[i]["text"];
+            }
+        }
+    }
+}
+
+// filter: {"program": "<id or name>", "selector": "<hex>", "limit": N}. The newest last.
+std::string LezActorsModuleImpl::events(std::string filterJson) {
+    json f = json::parse(unquote(filterJson), nullptr, false);
+    if (!f.is_object()) f = json::object();
+    std::string prog = f.value("program", ""), sel = f.value("selector", "");
+    size_t limit = f.contains("limit") && f["limit"].is_number_unsigned() ? f["limit"].get<size_t>() : 300;
+    std::lock_guard<std::recursive_mutex> lk(m_mtx);
+    json out = json::array();
+    size_t total = 0;
+    for (const auto& e : m_events) {
+        if (!prog.empty() && e.value("programId", "") != prog && e.value("programName", "") != prog) continue;
+        if (!sel.empty() && e.value("selector", "") != sel) continue;
+        total++;
+        out.push_back(e);
+    }
+    if (out.size() > limit) out.erase(out.begin(), out.begin() + long(out.size() - limit));
+    return ok({{"events", out}, {"matching", total}, {"indexerTip", m_indexerTip}, {"indexerUrl", indexerUrl()},
+               {"available", m_chainState == "running" && lez::childAlive(m_indexerPid)}, {"error", m_eventsError}});
 }

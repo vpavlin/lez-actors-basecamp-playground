@@ -21,8 +21,8 @@
 // The state is the last few hops this actor took part in, one line each ("->" sent, "<-" received),
 // so the conversation can be read back from the chain: a sync round trip adds its "->" and "<-"
 // lines to the same actor in one transaction; a ping's "<-" line lands on the receiver's actor.
-// (It also emits each hop as an event; a standalone dev chain never finalizes its blocks, and the
-// sequencer stores events only for final blocks, so the app reads the state instead.)
+// Each hop also emits an event (selector b"acv_hop_"), kept once the block finalizes; the app
+// draws the hops from the state at once and marks each one finalized when its event arrives.
 use borsh::{BorshDeserialize, BorshSerialize};
 use lee_core::{
     account::{AccountId, Actor},

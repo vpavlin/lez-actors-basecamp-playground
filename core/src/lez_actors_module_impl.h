@@ -79,6 +79,9 @@ public:
     std::string runExampleStep(std::string requestJson);
     std::string programSource(std::string name);
 
+    // --- program events: the finalized record, from the local chain's indexer (ADR 0003) ---
+    std::string events(std::string filterJson);
+
 protected:
     void onContextReady() override;
 
@@ -160,6 +163,16 @@ private:
     pid_t m_nodePid = 0, m_indexerPid = 0;
     std::string startBedrock(const std::string& home);   // "" or what failed
     void stopBedrock();
+
+    // program events, polled off the indexer by m_eventsThread (newest last, capped)
+    std::vector<lez::json> m_events;
+    uint64_t m_eventsFrom = 0;          // next block to read
+    std::string m_eventsError;
+    long long m_indexerTip = -1;
+    std::thread m_eventsThread;
+    void eventsLoop();
+    void refreshEvents();
+    void stampHops(const std::vector<lez::json>& fresh);
 
     QTimer* m_loop = nullptr;
     std::thread m_worker;

@@ -85,3 +85,9 @@ The ported files are in [../bedrock/](../bedrock/), with the scripts that ran th
   `send_pub_tx_paid_by` works.
 - `program_deployment::deploy_program` counts segments from the `.bin` size, but the loader wants
   `ceil(user ELF / 96 KiB)`: "Program bytecode splits into 3 segment(s) but 4 were supplied".
+- core_ffi's `sequencer_ffi_query_block_by_tx_hash` answered block 53 for a transaction the sequencer's
+  `getTransaction` (and `getBlock`) put in block 51 (2026-10-26). The app now asks `getTransaction`.
+- A program deploy once failed with "segment 0 transaction did not finalize" ("Transaction not found
+  in preconfigured amount of blocks") on a healthy, finalizing chain: segments 3-1 landed, segment 0
+  never did. The wallet can't resume a partial upload (FIXME in `program_loader.rs`), so the app
+  retries the deploy with fresh accounts.

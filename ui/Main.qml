@@ -40,6 +40,9 @@ Item {
     property var chainLog: []        // localChainLog() lines
     property int chainLogSeq: 0
     property bool showLog: false
+    property var ev: ({})                 // events(): the finalized record from the local indexer
+    property string evProgram: ""
+    property string evSelector: ""
     property var stepText: ({})      // "example/step" -> edited text
     property var sources: ({})       // program source name -> {source, origin}
     function loadSource(name) {
@@ -98,7 +101,8 @@ Item {
         var sel = root.st.selected || ""
         var walletOpen = !!(root.st.wallet && root.st.wallet.open)
         var guided = tabs.currentIndex === 0
-        var pending = 3 + (walletOpen ? 1 : 0) + (sel ? 1 : 0) + (guided ? 1 : 0) + (root.showLog ? 1 : 0)
+        var evTab = tabs.currentIndex === 2
+        var pending = 3 + (walletOpen ? 1 : 0) + (sel ? 1 : 0) + (guided ? 1 : 0) + (root.showLog ? 1 : 0) + (evTab ? 1 : 0)
         var fin = function () { if (--pending > 0) return; root.busy = false; if (root.again) { root.again = false; root.refresh() } }
         root.core("snapshot", [], function (raw) { var s = root.parse(raw); if (s && s.status === "ok") { root.st = s; root.reportJobs(s.jobs || []) } fin() })
         root.core("health", [], function (raw) { var h = root.parse(raw); if (h) root.hl = h; fin() })
@@ -106,6 +110,9 @@ Item {
         if (walletOpen) root.core("listAccounts", [], function (raw) { var a = root.parse(raw); if (a && a.status === "ok") root.accounts = a.accounts; fin() })
         if (sel) root.core("getAccount", [sel], function (raw) { var d = root.parse(raw); if (d && d.status === "ok") root.detail = d; fin() })
         if (guided) root.core("listExamples", [], function (raw) { var e = root.parse(raw); if (e && e.status === "ok") root.examples = e.examples; fin() })
+        if (evTab) root.core("events", [JSON.stringify({ program: root.evProgram.trim(), selector: root.evSelector.trim().toLowerCase(), limit: 200 })], function (raw) {
+            var e = root.parse(raw); if (e && e.status === "ok") root.ev = e; fin()
+        })
         if (root.showLog) root.core("localChainLog", [String(root.chainLogSeq)], function (raw) {
             var l = root.parse(raw)
             if (l && l.status === "ok" && l.lines.length) {
@@ -510,7 +517,7 @@ Item {
                     color: root.hl.reachable ? root.cText2 : root.cErr
                     text: root.hl.reachable
                           ? "Connected - block " + root.hl.blockHeight + "  -  base fees: execution " + root.hl.baseFeeExec + ", storage " + root.hl.baseFeeStor + " (raw units per gas / per byte)"
-                          : "Not reachable: " + (root.hl.error || "...") + "\nStart the local chain in Guided below, or run a v0.4 sequencer yourself (LEZ dev, standalone)."
+                          : "Not reachable: " + (root.hl.error || "...") + "\nStart the local chain in Guided below, or run a v0.4 sequencer yourself (LEZ dev)."
                 }
             }
 
@@ -551,6 +558,7 @@ Item {
                 onCurrentIndexChanged: root.refresh()
                 TabButton { text: "Guided: deploy and run the v0.4 examples" }
                 TabButton { text: "Explorer: accounts, any program, transfers" }
+                TabButton { text: "Events: the finalized record" }
             }
 
             // ── Guided: the wizard ─────────────────────────────────────────────────
@@ -576,8 +584,9 @@ Item {
                     }
                     T2 {
                         Layout.fillWidth: true
-                        text: "A single-node LEZ sequencer (LEZ dev, the actor model) running inside this app: no Docker, no Bedrock node, nothing to download. "
-                              + "Guests run without real proofs (RISC0_DEV_MODE), and its genesis funds two dev accounts. A block every 3 seconds. Its data stays in the app's folder until you reset it."
+                        text: "A single-node LEZ sequencer (LEZ dev, the actor model) running inside this app, following a Bedrock node the app runs next to it, with LEZ's indexer: no Docker, nothing to download. "
+                              + "A block every 3 seconds; Bedrock finalizes each one about a block later, and from then on its program events are kept (the Events tab). "
+                              + "Guests run without real proofs (RISC0_DEV_MODE), and its genesis funds two dev accounts. Its data stays in the app's folder until you reset it."
                     }
                     T2 { visible: !!root.chain.error; Layout.fillWidth: true; color: root.cErr; text: root.chain.error || "" }
                     RowLayout {
@@ -846,6 +855,14 @@ Item {
                                                 Layout.fillWidth: true
                                                 spacing: 0
                                                 T3 { Layout.fillWidth: true; color: root.cText; text: modelData.text; font.family: "monospace" }
+                                                // ADR 0003: the hop's event, once the block is final
+                                                T3 {
+                                                    Layout.fillWidth: true
+                                                    color: modelData.finalizedBlock !== undefined ? root.cOk : root.cText3
+                                                    text: modelData.finalizedBlock !== undefined
+                                                          ? "✓ finalized in block " + modelData.finalizedBlock + ": its event says \u201c" + (modelData.eventText || "") + "\u201d"
+                                                          : "… its event will show once the block is finalized (a block or two)"
+                                                }
                                                 T3 {
                                                     Layout.fillWidth: true
                                                     text: "on (" + root.accountLabel(modelData.accountId) + ", actor_conversation)  -  "
@@ -1144,6 +1161,64 @@ Item {
                             }
                         }
                     }
+                }
+            }
+            // ── Events: what the indexer kept, once blocks finalize (ADR 0003) ─────────────
+            ColumnLayout {
+                objectName: "events"
+                visible: tabs.currentIndex === 2
+                Layout.fillWidth: true
+                spacing: root.sp
+                Card {
+                    T1 { text: "Program events, the finalized record" }
+                    T2 {
+                        Layout.fillWidth: true
+                        text: "A program emits events from its handler (Response::event, an 8-byte selector and some data). The sequencer keeps them only for blocks that Bedrock has FINALIZED, and the indexer serves them. So this list trails the chain's head by a block or two: the actors' state changes the moment a transaction lands, its events show up once its block is final."
+                    }
+                    T3 {
+                        Layout.fillWidth: true
+                        color: root.ev.available ? root.cText3 : root.cWarn
+                        text: root.ev.available
+                              ? "Indexer " + (root.ev.indexerUrl || "") + "  -  finalized up to block " + (root.ev.indexerTip >= 0 ? root.ev.indexerTip : "?")
+                                + (root.hl && root.hl.blockHeight !== undefined ? ", the chain's head is block " + root.hl.blockHeight : "")
+                                + "  -  " + (root.ev.matching || 0) + " event" + (root.ev.matching === 1 ? "" : "s") + (root.evProgram || root.evSelector ? " match" : "")
+                                + (root.ev.error ? "  -  " + root.ev.error : "")
+                              : "Events come from the built-in chain's indexer: start the local chain on the Guided tab."
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Field { placeholderText: "program: a name (actor_conversation) or an id"; text: root.evProgram; onTextEdited: root.evProgram = text }
+                        Field { placeholderText: "selector, hex (6163765f686f705f)"; text: root.evSelector; onTextEdited: root.evSelector = text; Layout.preferredWidth: 220; Layout.fillWidth: false }
+                    }
+                }
+                Card {
+                    visible: !!(root.ev.events && root.ev.events.length)
+                    Repeater {
+                        // newest block first, a transaction's events in the order they ran
+                        model: root.ev.events ? root.ev.events.map(function (e, i) { return { e: e, i: i } }).sort(function (a, b) {
+                            return (b.e.block - a.e.block) || (b.e.txIndex - a.e.txIndex) || (a.i - b.i)
+                        }).map(function (x) { return x.e }) : []
+                        delegate: ColumnLayout {
+                            required property var modelData
+                            Layout.fillWidth: true
+                            spacing: 1
+                            RowLayout {
+                                Layout.fillWidth: true
+                                T2 { text: "block " + modelData.block + " · tx " + modelData.txIndex; color: root.cOk }
+                                T2 { text: modelData.programName || root.shortId(modelData.programId); color: root.cText }
+                                T3 { text: modelData.selectorName ? modelData.selectorName + " (" + modelData.selector + ")" : modelData.selector; font.family: "monospace"; Layout.fillWidth: true }
+                            }
+                            T3 { visible: modelData.text !== undefined; Layout.fillWidth: true; color: root.cText2; text: modelData.text !== undefined ? modelData.text : "" }
+                            T3 { visible: modelData.text === undefined; Layout.fillWidth: true; color: root.cText2; font.family: "monospace"; wrapMode: Text.WrapAnywhere; text: modelData.dataHex ? "0x" + modelData.dataHex : "(no data)" }
+                            T3 { text: "tx " + modelData.txHash; font.family: "monospace"; Layout.fillWidth: true; elide: Text.ElideMiddle; wrapMode: Text.NoWrap }
+                            Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: root.cLine }
+                        }
+                    }
+                }
+                T3 {
+                    visible: !!root.ev.available && !(root.ev.events && root.ev.events.length)
+                    Layout.fillWidth: true
+                    text: root.evProgram || root.evSelector ? "Nothing matches yet." : "No events yet. Run the actor_conversation steps on the Guided tab: each hop emits one."
                 }
             }
             Item { Layout.preferredHeight: 40 }

@@ -26,6 +26,7 @@ logos_module(
         src/lez_logtap.hpp
         src/lez_examples.hpp
         src/lez_local_chain.cpp
+        src/lez_bedrock.hpp
         ${CMAKE_CURRENT_BINARY_DIR}/lez_examples_data.cpp
     INCLUDE_DIRS src
     FIND_PACKAGES OpenSSL
