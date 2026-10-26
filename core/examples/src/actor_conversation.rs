@@ -21,8 +21,10 @@
 // The state is the last few hops this actor took part in, one line each ("->" sent, "<-" received),
 // so the conversation can be read back from the chain: a sync round trip adds its "->" and "<-"
 // lines to the same actor in one transaction; a ping's "<-" line lands on the receiver's actor.
-// Each hop also emits an event (selector b"acv_hop_"), kept once the block finalizes; the app
-// draws the hops from the state at once and marks each one finalized when its event arrives.
+// Each hop also emits an event (selector b"acv_hop_") carrying a structured `Hop` (the acting
+// account, the peer account, the hop kind, and the sentence), kept once the block finalizes. The
+// app can draw the whole actor map from these events alone once they arrive; the per-actor state
+// above is still the conversation's human-readable log.
 use borsh::{BorshDeserialize, BorshSerialize};
 use lee_core::{
     account::{AccountId, Actor},
@@ -38,8 +40,30 @@ enum Message {
     Pong { note: Vec<u8> },
 }
 
-/// Every hop's event carries this selector; its data is one line of text.
+/// Every hop's event carries this selector. Its data is a Borsh-encoded `Hop`: the acting account,
+/// the peer account, the hop kind, and the human sentence. The app draws the whole actor map from
+/// these events alone (the kind gives the arrow, the accounts give its ends), so it no longer needs
+/// the per-actor state diff for the map.
 const HOP: [u8; 8] = *b"acv_hop_";
+
+/// Which kind of hop an event records. One byte on the wire (Borsh enum discriminant).
+#[derive(BorshSerialize, BorshDeserialize)]
+enum HopKind {
+    SyncRequest = 0,    // this actor sent a synchronous request to `peer`
+    SyncReply = 1,      // `peer` answered; this actor runs again to handle the reply
+    AsyncSent = 2,      // this actor sent an asynchronous message to `peer`
+    AsyncReceived = 3,  // an asynchronous message from `peer` arrived at this actor
+}
+
+/// One hop of a conversation, as carried in a `HOP` event's data (Borsh):
+/// `actor` [32] ++ `peer` [32] ++ `kind` [1 byte] ++ `text` (u32-LE length ++ UTF-8 bytes).
+#[derive(BorshSerialize, BorshDeserialize)]
+struct Hop {
+    actor: AccountId,
+    peer: AccountId,
+    kind: HopKind,
+    text: String,
+}
 /// Marks the request a reply belongs to, in this actor's state, between the two runs.
 const PENDING: &str = "#pending min=";
 const KEEP_LINES: usize = 8;
@@ -50,8 +74,8 @@ fn short(id: &AccountId) -> String {
     id.value()[..4].iter().map(|b| format!("{b:02x}")).collect::<String>() + "…"
 }
 
-fn hop(text: String) -> ProgramEvent {
-    ProgramEvent { selector: HOP, data: text.into_bytes() }
+fn hop(actor: AccountId, peer: AccountId, kind: HopKind, text: String) -> ProgramEvent {
+    ProgramEvent { selector: HOP, data: borsh::to_vec(&Hop { actor, peer, kind, text }).expect("a hop serializes") }
 }
 
 /// The state's lines, without a pending marker.
@@ -82,7 +106,7 @@ fn ask(input: &ReceiveInput, of: AccountId, min: u128) -> Response {
     state.push_str(&format!("\n{PENDING}{min}"));
     Response::set_state(state.into_bytes())
         .send_sync(Actor::native_balance(of), &native_token::Message::ReadState)
-        .event(hop(format!(
+        .event(hop(input.receiver.account_id, of, HopKind::SyncRequest, format!(
             "actor_conversation on {} asks the native token on {} for {what}: a synchronous ReadState, answered in this same transaction",
             short(&input.receiver.account_id),
             short(&of)
@@ -99,7 +123,7 @@ fn on_reply(input: &ReceiveInput, reply: &StateReply) -> Response {
         short(&of)
     );
     Response::set_state(with_line(&input.pre_state, format!("<- StateReply from the native token on {}: balance {balance}", short(&of))))
-        .event(hop(format!(
+        .event(hop(input.receiver.account_id, of, HopKind::SyncReply, format!(
             "the native token on {} replied with a StateReply (balance {balance}); actor_conversation runs again to handle it and records the balance",
             short(&of)
         )))
@@ -119,7 +143,7 @@ fn handle_message(input: &ReceiveInput) -> Response {
             let text = String::from_utf8_lossy(&note).into_owned();
             Response::set_state(with_line(&input.pre_state, format!("-> sent Pong \"{text}\" to actor_conversation on {} (async)", short(&to))))
                 .send_async(Actor::new(to, me.program_account_id), &Message::Pong { note })
-                .event(hop(format!(
+                .event(hop(me.account_id, to, HopKind::AsyncSent, format!(
                     "actor_conversation on {} sends Pong to actor_conversation on {} asynchronously: it runs after the synchronous work",
                     short(&me.account_id),
                     short(&to)
@@ -130,7 +154,7 @@ fn handle_message(input: &ReceiveInput) -> Response {
             let from = input.from.expect("from_own_program implies a sender").account_id;
             let text = String::from_utf8_lossy(&note).into_owned();
             Response::set_state(with_line(&input.pre_state, format!("<- Pong \"{text}\" from actor_conversation on {} (async: ran after the sync work, same transaction)", short(&from))))
-                .event(hop(format!(
+                .event(hop(me.account_id, from, HopKind::AsyncReceived, format!(
                     "Pong from {} arrives at actor_conversation on {}, after the synchronous work",
                     short(&from),
                     short(&me.account_id)
