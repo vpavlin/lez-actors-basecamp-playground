@@ -13,6 +13,19 @@ static int fails = 0, passes = 0;
 #define CHECK(c, m) do { if (c) passes++; else { fails++; std::printf("FAIL: %s\n", m); } } while (0)
 using namespace lez;
 int main() {
+    {   // acv_hop_ event data (Borsh Hop)
+        Bytes d(32, 1); d.insert(d.end(), 32, 2); d.push_back(2);
+        std::string t = "sends Pong"; uint32_t n = uint32_t(t.size());
+        for (int i = 0; i < 4; i++) d.push_back(uint8_t(n >> (8 * i)));
+        d.insert(d.end(), t.begin(), t.end());
+        auto h = decodeHop(d);
+        CHECK(h && h->actor[0] == 1 && h->peer[31] == 2 && h->kind == 2 && h->text == t, "decodeHop: actor, peer, kind, text");
+        CHECK(std::string(hopKindName(2)) == "async sent", "hop kind names");
+        Bytes bad = d; bad.push_back(0);
+        CHECK(!decodeHop(bad), "decodeHop refuses trailing bytes");
+        Bytes plain(t.begin(), t.end());
+        CHECK(!decodeHop(plain), "decodeHop refuses a plain sentence (the 0.4.0 guest)");
+    }
     CHECK(b58(nativeTokenId()) == std::string(32, '1'), "native token id is 32 ones in base58");
     CHECK(b58(programLoaderId()) == "JAQ5MVHbCkSYRzXunsrNuM2m1LS859PGveHfoYPAmcvZ", "program loader id (prog-tui's vector)");
     auto pl = parseId("JAQ5MVHbCkSYRzXunsrNuM2m1LS859PGveHfoYPAmcvZ");

@@ -114,6 +114,17 @@ ok=bool(h) and all(x.get("block")==x.get("finalizedBlock") for x in h)
 ok or print("   hops:", [(x.get("block"), x.get("finalizedBlock")) for x in h])
 sys.exit(0 if ok else 1)'
 check $? "a hop's block (the sequencer's) is the block its event finalized in"
+echo "$SNAP" | python3 -c 'import json,sys
+d=json.load(sys.stdin); ex=d["exampleAccounts"]; payer=d["payer"]
+def ev(step):
+    j=[j for j in d["jobs"] if j["request"].get("example")=="actor_conversation" and j["request"].get("step")==step and j["state"]=="applied"]
+    return j[0]["result"].get("hopEvents",[]) if j else []
+a=[(h.get("actorId"),h.get("peerId"),h.get("kind")) for h in ev("ask")]
+p=[(h.get("actorId"),h.get("peerId"),h.get("kind")) for h in ev("ping")]
+ok = a==[(ex[0],payer,0),(ex[0],payer,1)] and p==[(ex[0],ex[1],2),(ex[1],ex[0],3)]
+ok or print("   ask:",a,"\n   ping:",p)
+sys.exit(0 if ok else 1)'
+check $? "the hop events say who acted, with whom and how (ask: request + reply on account 1; ping: sent by 1, received by 2)"
 echo "$(call events 'str:{"program":"actor_conversation","selector":"0000000000000000"}')" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)["matching"]==0 else 1)'
 check $? "events() filters by program and selector"
 

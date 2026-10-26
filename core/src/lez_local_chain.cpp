@@ -78,6 +78,14 @@ bool noise(const std::string& line) {
            line.find("LogosAPIConsumer") != std::string::npos;
 }
 
+// A hop as the step result carries it, from its event: the block it finalized in, the sentence,
+// and (from the 0.4.1 guest) who acted, the peer and the kind.
+json hopEventOf(const json& e) {
+    json h = {{"block", e.value("block", json(nullptr))}, {"text", e.value("text", "")}};
+    if (e.contains("hop")) for (auto& [k, v] : e["hop"].items()) h[k] = v;
+    return h;
+}
+
 }  // namespace
 
 // =============================================================================================
@@ -525,7 +533,7 @@ void LezActorsModuleImpl::runExample(Job& j) {
         std::vector<json> mine;
         { std::lock_guard<std::recursive_mutex> lk(m_mtx); for (const auto& e : m_events) if (e.value("txHash", "") == j.txHash) mine.push_back(e); }
         json evs = json::array();
-        for (const auto& e : mine) if (e.value("selector", "") == "6163765f686f705f") evs.push_back({{"block", e["block"]}, {"text", e.value("text", "")}});
+        for (const auto& e : mine) if (e.value("selector", "") == "6163765f686f705f") evs.push_back(hopEventOf(e));
         if (!evs.empty()) {
             j.result["hopEvents"] = evs; j.result["finalizedBlock"] = evs[0]["block"];
             for (size_t i = 0; i < hops.size() && i < evs.size(); i++) { j.result["hops"][i]["finalizedBlock"] = evs[i]["block"]; j.result["hops"][i]["eventText"] = evs[i]["text"]; }
@@ -718,7 +726,13 @@ void LezActorsModuleImpl::refreshEvents() {
             json row = {{"block", e.value("block_id", 0)}, {"txIndex", e.value("tx_index", 0)}, {"txHash", e.value("tx_hash", "")},
                         {"programId", prog}, {"programName", programName(prog)}, {"selector", sel}, {"selectorName", selectorName(sel)},
                         {"dataHex", lez::hex(lez::Bytes(data.begin(), data.end()))}};
-            if (printable(data)) row["text"] = data;
+            if (sel == "6163765f686f705f") {
+                // actor_conversation's Hop: who acted, with whom, how, and the sentence
+                if (auto h = lez::decodeHop(lez::Bytes(data.begin(), data.end()))) {
+                    row["text"] = h->text;
+                    row["hop"] = {{"actorId", lez::b58(h->actor)}, {"peerId", lez::b58(h->peer)}, {"kind", h->kind}, {"kindName", lez::hopKindName(h->kind)}};
+                } else if (printable(data)) row["text"] = data;   // a 0.4.0 guest: the sentence alone
+            } else if (printable(data)) row["text"] = data;
             fresh.push_back(row);
         }
         std::lock_guard<std::recursive_mutex> lk(m_mtx);
@@ -746,7 +760,7 @@ void LezActorsModuleImpl::stampHops(const std::vector<json>& fresh) {
         auto it = byTx.find(j.txHash);
         if (it == byTx.end() || j.txHash.empty() || !j.result.is_object()) continue;
         json evs = json::array();
-        for (const json* e : it->second) evs.push_back({{"block", (*e)["block"]}, {"text", e->value("text", "")}});
+        for (const json* e : it->second) evs.push_back(hopEventOf(*e));
         j.result["hopEvents"] = evs;
         j.result["finalizedBlock"] = (*it->second.front())["block"];
         if (j.result.contains("hops") && j.result["hops"].is_array()) {

@@ -48,6 +48,7 @@ const HOP: [u8; 8] = *b"acv_hop_";
 
 /// Which kind of hop an event records. One byte on the wire (Borsh enum discriminant).
 #[derive(BorshSerialize, BorshDeserialize)]
+#[borsh(use_discriminant = true)]
 enum HopKind {
     SyncRequest = 0,    // this actor sent a synchronous request to `peer`
     SyncReply = 1,      // `peer` answered; this actor runs again to handle the reply

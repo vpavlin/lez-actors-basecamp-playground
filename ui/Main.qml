@@ -161,6 +161,7 @@ Item {
         var ex = root.st.exampleAccounts || []
         if (id === ex[0]) return "example account 1"
         if (id === ex[1]) return "example account 2"
+        if (id && id === root.st.payer) return "the payer " + root.shortId(id)
         return root.shortId(id)
     }
     // copy to the clipboard through a hidden text edit (QML has no clipboard API of its own)
@@ -832,14 +833,49 @@ Item {
                                         Layout.fillWidth: true
                                         text: "Each box is an actor: one account (column) under one program (row), with its state. Arrows are messages, numbered in the order they ran, all inside one transaction. Solid: sync (runs right away). Dashed: async (runs after the sync work). Red ✕: where it panicked or the engine refused; grey: undone or never ran, because the transaction reverted."
                                     }
-                                    // the conversation, hop by hop, as the program recorded it
+                                    // the conversation from its finalized events: each acv_hop_ event says who acted,
+                                    // with whom and how (sync request/reply, async sent/received)
                                     T2 {
-                                        visible: !!(stepBox.job && stepBox.job.result && stepBox.job.result.hops && stepBox.job.result.hops.length)
+                                        readonly property var evh: stepBox.job && stepBox.job.result && stepBox.job.result.hopEvents ? stepBox.job.result.hopEvents.filter(function (h) { return !!h.actorId }) : []
+                                        id: evHopsTitle
+                                        visible: evh.length > 0
+                                        Layout.fillWidth: true
+                                        text: "The conversation, from its events (finalized in block " + (evh.length ? evh[0].block : "") + "): each hop emitted who acted, with whom, and how."
+                                        color: root.cOk
+                                    }
+                                    Repeater {
+                                        model: evHopsTitle.evh
+                                        delegate: RowLayout {
+                                            required property var modelData
+                                            required property int index
+                                            readonly property bool isAsync: modelData.kind === 2 || modelData.kind === 3
+                                            Layout.fillWidth: true
+                                            Rectangle {
+                                                Layout.preferredWidth: 22; Layout.preferredHeight: 22; radius: 11
+                                                Layout.alignment: Qt.AlignTop
+                                                color: parent.isAsync ? root.cWarn : root.cPrimary
+                                                Text { anchors.centerIn: parent; text: String(index + 1); color: "#10130f"; font.pixelSize: 12; font.weight: Font.DemiBold }
+                                            }
+                                            ColumnLayout {
+                                                Layout.fillWidth: true
+                                                spacing: 0
+                                                T3 {
+                                                    Layout.fillWidth: true; color: root.cText; font.family: "monospace"
+                                                    text: root.accountLabel(modelData.actorId) + (modelData.kind === 0 || modelData.kind === 2 ? "  ->  " : "  <-  ") + root.accountLabel(modelData.peerId)
+                                                          + "   (" + (modelData.kindName || "") + ")"
+                                                }
+                                                T3 { Layout.fillWidth: true; color: root.cText2; text: modelData.text || "" }
+                                            }
+                                        }
+                                    }
+                                    // before the events arrive (or from a 0.4.0 guest): the lines the hops wrote into the actors' state
+                                    T2 {
+                                        visible: evHopsTitle.evh.length === 0 && !!(stepBox.job && stepBox.job.result && stepBox.job.result.hops && stepBox.job.result.hops.length)
                                         text: "The conversation, read back from the chain (each hop wrote one line into its own actor's state; -> sent, <- received):"
                                         color: root.cText
                                     }
                                     Repeater {
-                                        model: stepBox.job && stepBox.job.result && stepBox.job.result.hops ? stepBox.job.result.hops : []
+                                        model: evHopsTitle.evh.length === 0 && stepBox.job && stepBox.job.result && stepBox.job.result.hops ? stepBox.job.result.hops : []
                                         delegate: RowLayout {
                                             required property var modelData
                                             required property int index
@@ -1207,6 +1243,12 @@ Item {
                                 T2 { text: "block " + modelData.block + " · tx " + modelData.txIndex; color: root.cOk }
                                 T2 { text: modelData.programName || root.shortId(modelData.programId); color: root.cText }
                                 T3 { text: modelData.selectorName ? modelData.selectorName + " (" + modelData.selector + ")" : modelData.selector; font.family: "monospace"; Layout.fillWidth: true }
+                            }
+                            T3 {
+                                visible: !!modelData.hop
+                                Layout.fillWidth: true; color: root.cText; font.family: "monospace"
+                                text: modelData.hop ? root.accountLabel(modelData.hop.actorId) + (modelData.hop.kind === 0 || modelData.hop.kind === 2 ? "  ->  " : "  <-  ")
+                                                      + root.accountLabel(modelData.hop.peerId) + "   (" + modelData.hop.kindName + ")" : ""
                             }
                             T3 { visible: modelData.text !== undefined; Layout.fillWidth: true; color: root.cText2; text: modelData.text !== undefined ? modelData.text : "" }
                             T3 { visible: modelData.text === undefined; Layout.fillWidth: true; color: root.cText2; font.family: "monospace"; wrapMode: Text.WrapAnywhere; text: modelData.dataHex ? "0x" + modelData.dataHex : "(no data)" }

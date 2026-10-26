@@ -187,4 +187,24 @@ inline TransferOutcome transferOutcome(u128 senderBefore, u128 senderAfter, u128
     return spent > 0 ? TransferOutcome::Reverted : TransferOutcome::Unchanged;
 }
 
+// actor_conversation's acv_hop_ event data (Borsh): actor [32] ++ peer [32] ++ kind u8 ++
+// text (u32-LE length ++ UTF-8). Kinds: 0 SyncRequest, 1 SyncReply, 2 AsyncSent, 3 AsyncReceived.
+struct Hop { Id actor{}, peer{}; uint8_t kind = 0; std::string text; };
+inline const char* hopKindName(uint8_t k) {
+    switch (k) { case 0: return "sync request"; case 1: return "sync reply"; case 2: return "async sent"; case 3: return "async received"; }
+    return "unknown";
+}
+inline std::optional<Hop> decodeHop(const Bytes& d) {
+    if (d.size() < 32 + 32 + 1 + 4) return std::nullopt;
+    Hop h;
+    std::copy(d.begin(), d.begin() + 32, h.actor.begin());
+    std::copy(d.begin() + 32, d.begin() + 64, h.peer.begin());
+    h.kind = d[64];
+    if (h.kind > 3) return std::nullopt;
+    uint32_t n = uint32_t(d[65]) | uint32_t(d[66]) << 8 | uint32_t(d[67]) << 16 | uint32_t(d[68]) << 24;
+    if (d.size() != 69 + size_t(n)) return std::nullopt;   // exactly one Hop, nothing after it
+    h.text.assign(d.begin() + 69, d.end());
+    return h;
+}
+
 }  // namespace lez
