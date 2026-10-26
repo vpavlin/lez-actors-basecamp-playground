@@ -2,6 +2,7 @@
 // (core_ffi's embedded sequencer, patches/0001), the dev chain's funded accounts, and the guided
 // examples: deploy LEZ's tutorial programs and run their steps.
 #include "lez_actors_module_impl.h"
+#include "lez_bedrock.hpp"
 #include "lez_examples.hpp"
 #include "lez_http.hpp"
 #include "lez_module_util.hpp"
@@ -24,9 +25,19 @@ uint16_t localPort() {
     return port;
 }
 std::string localUrl() { return "http://127.0.0.1:" + std::to_string(localPort()); }
+// The Bedrock node and the indexer sit on the next ports (ADR 0003).
+int nodeApiPort() { return localPort() + 1; }
+int nodeSwarmPort() { return localPort() + 2; }
+int nodeBlendPort() { return localPort() + 3; }
+int indexerPort() { return localPort() + 4; }
+std::string indexerUrl() { return "http://127.0.0.1:" + std::to_string(indexerPort()); }
+// marks a chain home made for a Bedrock node (a 0.3.x home is standalone: its checkpoint names a
+// channel no node has)
+const char* kBedrockMarker = ".bedrock";
 // LEZ's debug sequencer config (lez/sequencer/service/configs/debug), for one node in this
 // process: no gossip, no metrics listener, a block every 3 s (the debug config's 15 s makes a
-// 4-transaction deploy take a minute). The genesis funds the two dev accounts below.
+// 4-transaction deploy take a minute), following the Bedrock node at @NODE@. The genesis funds the
+// two dev accounts below.
 const char* kChainTemplate = R"({
   "home": ".",
   "max_num_tx_in_block": 20,
@@ -36,7 +47,7 @@ const char* kChainTemplate = R"({
   "metrics_address": null,
   "bedrock_config": {
     "channel_id": "0101010101010101010101010101010101010101010101010101010101010101",
-    "node_url": "http://localhost:18080"
+    "node_url": "@NODE@"
   },
   "genesis": {
     "channel_params": { "minimum_sequencer_stake": 149, "posting_timeframe": 300, "posting_timeout": 25, "exit_delay": 100, "max_block_size": 1048576 },
@@ -48,8 +59,8 @@ const char* kChainTemplate = R"({
     ]
   }
 })";
-// the Bedrock funding key `sequencer_service setup` is given in LEZ's dev instructions (unused
-// in standalone mode, but setup wants one)
+// the Bedrock funding key `sequencer_service setup` is given in LEZ's dev instructions: a key the
+// node's wallet holds (bedrock/node-config.yaml), which pays the sequencer's inscriptions
 const char* kFundingPublicKey = "2e03b2eff5a45478e7e79668d2a146cf2c5c7925bce927f2b1c67f2ab4fc0d26";
 // the dev genesis' funded public accounts: LEZ Justfile wallet-import-test-accounts (public dev
 // keys, never real ones)
@@ -75,7 +86,9 @@ bool noise(const std::string& line) {
 std::string LezActorsModuleImpl::localChainStatus() {
     std::lock_guard<std::recursive_mutex> lk(m_mtx);
     return ok({{"state", m_chainState}, {"error", m_chainError}, {"rpcUrl", localUrl()}, {"home", m_dataDir + "/chain"},
-               {"inProcess", m_chain != nullptr}, {"logSeq", m_tap.lastSeq()}});
+               {"inProcess", m_chain != nullptr}, {"logSeq", m_tap.lastSeq()},
+               {"nodeUrl", "http://127.0.0.1:" + std::to_string(nodeApiPort())}, {"nodeRunning", lez::childAlive(m_nodePid)},
+               {"indexerUrl", indexerUrl()}, {"indexerRunning", lez::childAlive(m_indexerPid)}});
 }
 
 std::string LezActorsModuleImpl::startLocalChain() {
@@ -118,6 +131,7 @@ std::string LezActorsModuleImpl::resetLocalChain() {
         SequencerServiceFFI* c;
         { std::lock_guard<std::recursive_mutex> lk(m_mtx); c = m_chain; m_chain = nullptr; }
         if (c) sequencer_ffi_stop_sequencer(c);
+        stopBedrock();
         std::string home;
         {
             std::lock_guard<std::recursive_mutex> lk(m_mtx);
@@ -152,6 +166,7 @@ void LezActorsModuleImpl::startChainThread(bool stop) {
             SequencerServiceFFI* c;
             { std::lock_guard<std::recursive_mutex> lk(m_mtx); c = m_chain; m_chain = nullptr; }
             if (c) sequencer_ffi_stop_sequencer(c);
+            stopBedrock();
             { std::lock_guard<std::recursive_mutex> lk(m_mtx); m_chainState = "stopped"; }
             if (*alive) onLoop([this] { publish(); });
         });
@@ -174,11 +189,37 @@ void LezActorsModuleImpl::startChainThread(bool stop) {
         setenv("RISC0_DEV_MODE", "1", 0);
         sequencer_ffi_init_logger("info");
         std::error_code ec;
+        // a 0.3.x chain is standalone (no Bedrock): its checkpoint names a channel the new node
+        // doesn't have, so it can't be resumed. Keep it aside instead of deleting it.
+        if (fs::exists(home + "/sequencer_config.json") && !fs::exists(home + "/" + kBedrockMarker)) {
+            std::string aside = home + ".standalone-0.3";
+            fs::remove_all(aside, ec);
+            fs::rename(home, aside, ec);
+            fprintf(stderr, "[lez_actors] the old standalone chain moved to %s\n", aside.c_str());
+        }
         fs::create_directories(home, ec);
-        if (!writeAtomic(tmpl, kChainTemplate)) return failWith("can't write " + tmpl);
+        writeAtomic(home + "/" + kBedrockMarker, "logos-blockchain 6b33abb\n");
+        if (std::string e = startBedrock(home); !e.empty()) return failWith(e);
+        std::string t = kChainTemplate;
+        t.replace(t.find("@NODE@"), 6, "http://127.0.0.1:" + std::to_string(nodeApiPort()));
+        if (!writeAtomic(tmpl, t)) return failWith("can't write " + tmpl);
         if (sequencer_ffi_local_setup(home.c_str(), tmpl.c_str(), kFundingPublicKey) != FfiOperationError_Success) return failWith("setting up the chain failed");
         InitializedSequencerServiceFFIResult r = sequencer_ffi_start_local(home.c_str(), localPort());
-        if (r.error != FfiOperationError_Success || !r.value) return failWith("the sequencer didn't start (is port " + std::to_string(localPort()) + " taken?)");
+        if (r.error != FfiOperationError_Success || !r.value) { stopBedrock(); return failWith("the sequencer didn't start (is port " + std::to_string(localPort()) + " taken?)"); }
+        // the indexer reads finalized blocks off the node; it starts once the channel exists
+        {
+            const std::string lib = lez::coreFfiLibDir(reinterpret_cast<const void*>(&sequencer_ffi_start_local));
+            const std::string exe = lib + "/indexer_service", dir = home + "/indexer";
+            fs::create_directories(dir, ec);
+            writeAtomic(dir + "/indexer.json", lez::indexerConfig(nodeApiPort()));
+            lez::killStale(home + "/indexer.pid", exe);
+            pid_t ip = lez::spawnChild(exe, {dir + "/indexer.json", "-p", std::to_string(indexerPort()), "-d", dir}, dir,
+                                       {{"RUST_LOG", "info"}}, home + "/indexer.log");
+            if (ip > 0) lez::writePidFile(home + "/indexer.pid", ip);
+            else fprintf(stderr, "[lez_actors] no indexer (%s): events won't be queryable\n", exe.c_str());
+            std::lock_guard<std::recursive_mutex> lk(m_mtx);
+            m_indexerPid = ip > 0 ? ip : 0;
+        }
         bool changed;
         {
             std::lock_guard<std::recursive_mutex> lk(m_mtx);
@@ -201,6 +242,39 @@ void LezActorsModuleImpl::startChainThread(bool stop) {
         if (*alive) onLoop([this] { publish(); });
     });
     publish();
+}
+
+// Starts the Bedrock node for `home` and waits until its API answers. "" or what failed.
+std::string LezActorsModuleImpl::startBedrock(const std::string& home) {
+    const std::string lib = lez::coreFfiLibDir(reinterpret_cast<const void*>(&sequencer_ffi_start_local));
+    const std::string exe = lib + "/logos-blockchain-node", dir = home + "/node";
+    if (access(exe.c_str(), X_OK) != 0) return "this build has no Bedrock node (" + exe + ")";
+    lez::killStale(home + "/node.pid", exe);
+    if (lez::portOpen(nodeApiPort())) return "something else already listens on 127.0.0.1:" + std::to_string(nodeApiPort()) + " (the Bedrock node's port; LEZ_ACTORS_CHAIN_PORT moves all of them)";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    if (!writeAtomic(dir + "/node-config.yaml", lez::nodeConfig(nodeApiPort(), nodeSwarmPort(), nodeBlendPort())) ||
+        !writeAtomic(dir + "/deployment-settings.yaml", lez::kDeploymentSettings))
+        return "can't write the node config in " + dir;
+    pid_t pid = lez::spawnChild(exe, {"node-config.yaml", "--deployment", "deployment-settings.yaml"}, dir,
+                                {{"POL_PROOF_DEV_MODE", "true"}}, home + "/node.log");
+    if (pid <= 0) return "the Bedrock node didn't start";
+    lez::writePidFile(home + "/node.pid", pid);
+    { std::lock_guard<std::recursive_mutex> lk(m_mtx); m_nodePid = pid; }
+    for (int i = 0; i < 600; i++) {   // up to 60 s
+        if (lez::portOpen(nodeApiPort())) return "";
+        if (!lez::childAlive(pid)) { std::lock_guard<std::recursive_mutex> lk(m_mtx); m_nodePid = 0; return "the Bedrock node exited at start (see " + home + "/node.log)"; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    stopBedrock();
+    return "the Bedrock node didn't open its API on port " + std::to_string(nodeApiPort()) + " within 60 s";
+}
+
+void LezActorsModuleImpl::stopBedrock() {
+    pid_t n, i;
+    { std::lock_guard<std::recursive_mutex> lk(m_mtx); n = m_nodePid; i = m_indexerPid; m_nodePid = m_indexerPid = 0; }
+    lez::stopChild(i);
+    lez::stopChild(n);
 }
 
 std::string LezActorsModuleImpl::localChainLog(std::string sinceSeq) {

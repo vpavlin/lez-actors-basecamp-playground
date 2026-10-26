@@ -1,7 +1,7 @@
 {
  "name": "lez_actors_module",
  "display_name": "LEZ Actors Core (playground)",
- "version": "0.3.3",
+ "version": "0.4.0",
  "type": "core",
  "interface": "universal",
  "category": "developer",
@@ -28,5 +28,9 @@
    "extra_include_dirs": [],
    "extra_link_libraries": []
   }
- }
+ },
+ "include": [
+  "logos-blockchain-node",
+  "indexer_service"
+ ]
 }

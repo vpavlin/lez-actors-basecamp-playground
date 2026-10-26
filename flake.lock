@@ -43,6 +43,23 @@
         "type": "github"
       }
     },
+    "logos-blockchain": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1792739505,
+        "narHash": "sha256-tAZnZjym/ylB5ivqmRti1MDRHD9JKp8TRmDfWa7lFrA=",
+        "owner": "logos-blockchain",
+        "repo": "logos-blockchain",
+        "rev": "6b33abb312e514dccf56885685fff5ffe093bb58",
+        "type": "github"
+      },
+      "original": {
+        "owner": "logos-blockchain",
+        "repo": "logos-blockchain",
+        "rev": "6b33abb312e514dccf56885685fff5ffe093bb58",
+        "type": "github"
+      }
+    },
     "logos-blockchain-circuits": {
       "inputs": {
         "nixpkgs": "nixpkgs"
@@ -148,6 +165,7 @@
     "root": {
       "inputs": {
         "lez": "lez",
+        "logos-blockchain": "logos-blockchain",
         "nixpkgs": [
           "lez",
           "nixpkgs"

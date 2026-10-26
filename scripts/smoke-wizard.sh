@@ -41,6 +41,14 @@ S=$(call startLocalChain); echo "  $S" | cut -c1-200
 for i in $(seq 1 60); do ST=$(call localChainStatus | field state); case "$ST" in running|failed|external) break;; esac; sleep 1; done
 [ "$ST" = running ]; check $? "the in-process chain is running (state: $ST $(call localChainStatus | field error))"
 H=$(call health); [ "$(echo "$H" | field reachable)" = True ]; check $? "it answers JSON-RPC on 127.0.0.1:$PORT (block $(echo "$H" | field blockHeight))"
+# ADR 0003: a real Bedrock node and an indexer run next to it
+CS=$(call localChainStatus)
+[ "$(echo "$CS" | field nodeRunning)" = True ]; check $? "the bundled Bedrock node runs ($(echo "$CS" | field nodeUrl))"
+[ "$(echo "$CS" | field indexerRunning)" = True ]; check $? "the bundled indexer runs ($(echo "$CS" | field indexerUrl))"
+IDX=$(echo "$CS" | field indexerUrl)
+evq() { curl -s -m10 -X POST -H 'content-type: application/json' -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getEvents\",\"params\":[{\"from_block\":$1}]}" "$IDX"; }
+for i in $(seq 1 60); do N=$(evq 0 | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("result",[])))' 2>/dev/null); [ "${N:-0}" -gt 0 ] && break; sleep 2; done
+[ "${N:-0}" -gt 0 ]; check $? "blocks finalize: the indexer has the genesis events ($N)"
 
 echo "== wallet + dev accounts"
 W=$(call createWallet str:wizard-pass); [ "$(echo "$W" | field status)" = ok ]; check $? "createWallet"

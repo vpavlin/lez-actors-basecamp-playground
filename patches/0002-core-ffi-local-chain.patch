@@ -1,8 +1,25 @@
+From 04e4fc9562e5f966b626402ee4429f73dbcc5f18 Mon Sep 17 00:00:00 2001
+From: Atlas <atlas@localhost>
+Date: Fri, 23 Oct 2026 15:13:53 +0200
+Subject: [PATCH] core_ffi: local-chain feature (LEZ Actors playground): an
+ in-process sequencer with JSON-RPC that follows a Bedrock node (no
+ standalone)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Cargo.lock                              |   2 +
+ lez/core_ffi/Cargo.toml                 |   4 +
+ lez/core_ffi/core_ffi.h                 |  20 ++++
+ lez/core_ffi/src/sequencer/api/local.rs | 118 ++++++++++++++++++++++++
+ lez/core_ffi/src/sequencer/api/mod.rs   |   2 +
+ 5 files changed, 146 insertions(+)
+ create mode 100644 lez/core_ffi/src/sequencer/api/local.rs
+
 diff --git a/Cargo.lock b/Cargo.lock
-index 2e5782d0..0b8a2ec6 100644
+index e99123d0..c2808686 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -1999,6 +1999,7 @@ dependencies = [
+@@ -1802,6 +1802,7 @@ dependencies = [
  name = "core_ffi"
  version = "0.1.0"
  dependencies = [
@@ -10,7 +27,7 @@ index 2e5782d0..0b8a2ec6 100644
   "bip39",
   "cbindgen",
   "common",
-@@ -2009,6 +2010,7 @@ dependencies = [
+@@ -1812,6 +1813,7 @@ dependencies = [
   "lee_core",
   "log",
   "programs",
@@ -19,7 +36,7 @@ index 2e5782d0..0b8a2ec6 100644
   "sequencer_service",
   "sequencer_service_rpc",
 diff --git a/lez/core_ffi/Cargo.toml b/lez/core_ffi/Cargo.toml
-index 5d5d6ede..7bd5d53f 100644
+index 5d5d6ede..0474095d 100644
 --- a/lez/core_ffi/Cargo.toml
 +++ b/lez/core_ffi/Cargo.toml
 @@ -8,6 +8,8 @@ edition = "2024"
@@ -35,8 +52,8 @@ index 5d5d6ede..7bd5d53f 100644
  [features]
  default = ["prove"]
  prove = ["lee/prove"]
-+# An in-process local dev chain with its JSON-RPC (src/sequencer/api/local.rs): no Bedrock, no r0vm.
-+local-chain = ["sequencer_service/rpc", "sequencer_service/standalone", "sequencer_service/prove"]
++# An in-process local dev chain with its JSON-RPC (src/sequencer/api/local.rs), following a Bedrock node; no r0vm.
++local-chain = ["sequencer_service/rpc", "sequencer_service/prove"]
 diff --git a/lez/core_ffi/core_ffi.h b/lez/core_ffi/core_ffi.h
 index f9fdd70b..1f830ffa 100644
 --- a/lez/core_ffi/core_ffi.h
@@ -70,17 +87,18 @@ index f9fdd70b..1f830ffa 100644
   *
 diff --git a/lez/core_ffi/src/sequencer/api/local.rs b/lez/core_ffi/src/sequencer/api/local.rs
 new file mode 100644
-index 00000000..fa5a23cd
+index 00000000..44dfdc9c
 --- /dev/null
 +++ b/lez/core_ffi/src/sequencer/api/local.rs
-@@ -0,0 +1,117 @@
+@@ -0,0 +1,118 @@
 +//! A local, single-node dev chain inside the embedding process (LEZ Actors playground patch).
 +//!
 +//! `sequencer_ffi_local_setup` does what `sequencer_service setup --create-channel` does (write the
 +//! config with its home, the channel signing key and the Bedrock funding public key);
 +//! `sequencer_ffi_start_local` starts it with its JSON-RPC server on a fixed loopback port, so a
 +//! wallet in the same process can talk to it like to any sequencer. Needs the `local-chain`
-+//! feature (sequencer_service `rpc` + `standalone` + `prove`: no Bedrock node, no r0vm).
++//! feature (sequencer_service `rpc` + `prove`; no r0vm). The template points it at a Bedrock
++//! node (the app runs one next to it), so blocks finalize and program events are kept.
 +use std::{
 +    ffi::{CStr, c_char},
 +    net::{Ipv4Addr, SocketAddr},
@@ -201,3 +219,6 @@ index 9cb51e96..e61d0d75 100644
 +pub mod local;
  pub mod logging;
  pub mod query;
+-- 
+2.55.0
+

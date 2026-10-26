@@ -37,6 +37,7 @@ LezActorsModuleImpl::~LezActorsModuleImpl() {
     if (m_wallet) { wallet_ffi_save(m_wallet); wallet_ffi_destroy(m_wallet); m_wallet = nullptr; }
     if (m_chainThread.joinable()) m_chainThread.join();
     if (m_chain) { sequencer_ffi_stop_sequencer(m_chain); m_chain = nullptr; }
+    stopBedrock();
     if (m_loop) { m_loop->stop(); delete m_loop; m_loop = nullptr; }
     m_tap.stop();
 }

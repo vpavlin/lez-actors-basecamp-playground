@@ -25,10 +25,16 @@ What we learned about v0.4 while building it (the model, fees, the C API, buildi
 
 ## The Guided tab
 
-1. **Start the local chain.** It's LEZ's sequencer, built into the core with `--features standalone,prove`:
-   no Docker, no Bedrock node, no r0vm. Guests run without real proofs (`RISC0_DEV_MODE`). It listens on
-   `127.0.0.1:3040` with a block every 3 s, and keeps its data in `~/.lez-actors/chain` until you
-   **Reset** it. If something already answers on :3040, the app uses that instead.
+1. **Start the local chain.** It's LEZ's sequencer, built into the core (`--features prove`: no r0vm;
+   guests run without real proofs, `RISC0_DEV_MODE`), following a **Bedrock node** and with LEZ's
+   **indexer** next to it. The app ships both and runs them for you (no Docker). Blocks finalize
+   about a block behind the head, so program events are kept, and the indexer serves them
+   (`getEvents`). Ports: the sequencer on `127.0.0.1:3040` (a block every 3 s), the node on 3041-3043,
+   the indexer on 3044; `LEZ_ACTORS_CHAIN_PORT` moves them all. Data stays in `~/.lez-actors/chain`
+   until you **Reset** it. If something already answers on :3040, the app uses that instead.
+   A chain made by 0.3.x (no Bedrock) can't be resumed; it's moved to `chain.standalone-0.3`.
+   Why and how: [docs/adr/0003](docs/adr/0003-bundled-bedrock-node.md),
+   [docs/bedrock-soak-2026-10-23.md](docs/bedrock-soak-2026-10-23.md).
 2. **Create a wallet** (it signs and pays).
 3. **Use the dev accounts**: the genesis-funded test keys from LEZ's Justfile. The 20 T one pays the fees.
 4. **The examples** (LEZ `examples/program_deployment`, prebuilt in `core/examples/`):
@@ -72,8 +78,11 @@ Tests: `core/test/run-tests.sh` (codec and example-message unit tests), `scripts
 the Guided path end to end, on the built-in chain), `scripts/smoke.sh` (headless, Explorer calls against a
 sequencer on :3040).
 
-The embedded chain comes from a small patch to core_ffi (`patches/0001-core-ffi-local-chain.patch`,
-[docs/adr/0002](docs/adr/0002-embedded-local-chain.md)).
+The embedded chain comes from two patches to LEZ: `patches/0001` moves its logos-blockchain dependency to
+`6b33abb3` and turns the zone SDK's pending-tx expiry back on (without it finality stops at an epoch
+boundary), `patches/0002` adds core_ffi's `local-chain` feature ([docs/adr/0002](docs/adr/0002-embedded-local-chain.md),
+[docs/adr/0003](docs/adr/0003-bundled-bedrock-node.md)). The root flake also builds the Bedrock node and
+LEZ's indexer, which the core package carries (`core/metadata.json` `include`).
 
 Why the wallet goes through `core_ffi` and not `lez_core`: [docs/adr/0001](docs/adr/0001-wallet-through-core-ffi.md).
 

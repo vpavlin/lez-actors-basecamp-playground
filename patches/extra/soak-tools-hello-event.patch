@@ -1,0 +1,111 @@
+From 75e5f14700ba800a8225962fcab7394b63a1f32d Mon Sep 17 00:00:00 2001
+From: Atlas <atlas@localhost>
+Date: Fri, 23 Oct 2026 15:01:13 +0200
+Subject: [PATCH] Soak tools: hello_event guest (emits hello_event::Greeted)
+ and run_event_soak
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ examples/program_deployment/Cargo.toml        |  2 +-
+ .../methods/guest/src/bin/hello_event.rs      | 16 ++++++
+ .../src/bin/run_event_soak.rs                 | 54 +++++++++++++++++++
+ 3 files changed, 71 insertions(+), 1 deletion(-)
+ create mode 100644 examples/program_deployment/methods/guest/src/bin/hello_event.rs
+ create mode 100644 examples/program_deployment/src/bin/run_event_soak.rs
+
+diff --git a/examples/program_deployment/Cargo.toml b/examples/program_deployment/Cargo.toml
+index bf20b3df..fb05678d 100644
+--- a/examples/program_deployment/Cargo.toml
++++ b/examples/program_deployment/Cargo.toml
+@@ -16,5 +16,5 @@ program_loader_core.workspace = true
+ sequencer_service_rpc = { workspace = true, features = ["client"] }
+ wallet.workspace = true
+ 
+-tokio = { workspace = true, features = ["macros"] }
++tokio = { workspace = true, features = ["macros", "time"] }
+ clap.workspace = true
+diff --git a/examples/program_deployment/methods/guest/src/bin/hello_event.rs b/examples/program_deployment/methods/guest/src/bin/hello_event.rs
+new file mode 100644
+index 00000000..bc8560cf
+--- /dev/null
++++ b/examples/program_deployment/methods/guest/src/bin/hello_event.rs
+@@ -0,0 +1,16 @@
++use lee_core::program::{ProgramEvent, ReceiveInput, Response};
++
++// Soak-test guest (LEZ Actors playground, not upstream): hello_world that also emits a
++// `hello_event::Greeted` event carrying the greeting, so the indexer has events in every block
++// that holds a call.
++
++lee_core::actor_entrypoint!(handle_message);
++
++// first 8 bytes of sha256("hello_event::Greeted")
++const GREETED: [u8; 8] = [0x98, 0xab, 0xe0, 0xff, 0x89, 0x5d, 0x39, 0xc5];
++
++fn handle_message(input: &ReceiveInput, greeting: Vec<u8>) -> Response {
++    let mut bytes = input.pre_state.to_vec();
++    bytes.extend(&greeting);
++    Response::set_state(bytes).event(ProgramEvent { selector: GREETED, data: greeting })
++}
+diff --git a/examples/program_deployment/src/bin/run_event_soak.rs b/examples/program_deployment/src/bin/run_event_soak.rs
+new file mode 100644
+index 00000000..e5a2b1eb
+--- /dev/null
++++ b/examples/program_deployment/src/bin/run_event_soak.rs
+@@ -0,0 +1,54 @@
++// Soak runner (LEZ Actors playground, not upstream): deploy the `hello_event` guest once, then call
++// it every `interval` seconds for `minutes`, one tx per call. Each call emits a
++// `hello_event::Greeted` event; the indexer's getEvents must keep returning them past epoch changes.
++//
++//   run_event_soak <hello_event.bin> <account_id> <payer_account_id> <minutes> <interval_s>
++
++use lee::AccountId;
++use program_loader_core::MAX_SEGMENT_DATA_LEN;
++use wallet::program_facades::program_loader::ProgramLoader;
++use wallet::WalletCore;
++
++#[tokio::main]
++async fn main() {
++    let mut wallet_core = WalletCore::from_env().unwrap();
++    let a: Vec<String> = std::env::args().collect();
++    let account_id: AccountId = a[2].parse().unwrap();
++    let payer: AccountId = a[3].parse().unwrap();
++    let minutes: u64 = a[4].parse().unwrap();
++    let interval: u64 = a[5].parse().unwrap();
++    let bytecode: Vec<u8> = std::fs::read(&a[1]).unwrap();
++    // the loader wants ceil(user_elf / segment size) segments, and the user ELF is smaller than the
++    // .bin; try counts down from the .bin's (as the playground does)
++    let mut program = None;
++    for count in (1..=bytecode.len().div_ceil(MAX_SEGMENT_DATA_LEN)).rev() {
++        let header = wallet_core.create_new_account_public(None).0;
++        let segments: Vec<AccountId> = std::iter::repeat_with(|| wallet_core.create_new_account_public(None).0).take(count).collect();
++        wallet_core.store_persistent_data().unwrap();
++        match ProgramLoader(&mut wallet_core).deploy(header, &segments, bytecode.clone(), true, Some(payer)).await {
++            Ok(id) => { program = Some(id); break; }
++            Err(e) => println!("deploy with {count} segments: {e}"),
++        }
++    }
++    let program = program.expect("deploy failed with every segment count");
++    println!("DEPLOYED {program}");
++    let end = std::time::Instant::now() + std::time::Duration::from_secs(minutes * 60);
++    let mut n = 0u64;
++    while std::time::Instant::now() < end {
++        n += 1;
++        let greeting = format!("soak #{n} at {}", chrono_like_now()).into_bytes();
++        // paid by `payer` (v0.4 needs a fee); the target account doesn't sign
++        let root = wallet::AccountIdentity::Public(account_id).select_program_actor_state(program);
++        let message = lee::program::Program::serialize_message(greeting).unwrap();
++        match wallet_core.send_pub_tx_paid_by(vec![root], 0, message, Some(payer)).await {
++            Ok(h) => println!("SENT {n} {h}"),
++            Err(e) => println!("SENDFAIL {n} {e:?}"),
++        }
++        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
++    }
++    println!("DONE {n}");
++}
++
++fn chrono_like_now() -> u64 {
++    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
++}
+-- 
+2.55.0
+

@@ -22,6 +22,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <sys/types.h>
 #include "logos_module_context.h"
 #include "lez_codec.hpp"
 #include "lez_logtap.hpp"
@@ -155,6 +156,10 @@ private:
     std::string m_chainState = "stopped";   // stopped | starting | running | stopping | failed | external
     std::string m_chainError;
     std::thread m_chainThread;
+    // the Bedrock node and the indexer next to it (children of this process; ADR 0003)
+    pid_t m_nodePid = 0, m_indexerPid = 0;
+    std::string startBedrock(const std::string& home);   // "" or what failed
+    void stopBedrock();
 
     QTimer* m_loop = nullptr;
     std::thread m_worker;
